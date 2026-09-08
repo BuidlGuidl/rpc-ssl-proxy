@@ -1,0 +1,13 @@
+[Unit]
+Description=Twice-daily Let's Encrypt renewal check for rpc-ssl-proxy
+
+[Timer]
+# Twice a day: certbot no-ops until the cert is inside its last 30 days, so this
+# gives ~60 chances to succeed instead of the single monthly attempt it replaces.
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=45m
+# Run on boot if a scheduled check was missed while the instance was down.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

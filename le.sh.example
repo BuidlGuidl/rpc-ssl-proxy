@@ -1,8 +1,62 @@
-#/bin/bash
-# sudo certbot certonly --standalone -d stage.mainnet.rpc.buidlguidl.com --config-dir ~/.certbot/config --logs-dir ~/.certbot/logs --work-dir ~/.certbot/work
-sudo certbot renew --force-renewal --cert-name stage.mainnet.rpc.buidlguidl.com --config-dir ~/.certbot/config --logs-dir ~/.certbot/logs --work-dir ~/.certbot/work -n
+#!/bin/bash
+# Template for le.sh, which is gitignored. Copy to le.sh and adjust CERT_NAME
+# and the directories below if this host differs.
+#
+# Renew the Let's Encrypt cert for the RPC proxy and install it.
+#
+# Safe to run as often as you like: certbot only renews inside the last 30 days
+# of the cert's life, and server.cert/server.key are only touched (and the proxy
+# only restarted) when a new cert is actually issued.
+#
+# Run FORCE=1 ./le.sh to re-issue regardless of expiry. Note that Let's Encrypt
+# allows only 5 duplicate certificates per week, so don't loop on this.
+#
+# Every path here is absolute on purpose. This script runs as root, and root's
+# HOME is /root, so a "~" would resolve to /root/.certbot instead of the real
+# cert store in /home/ubuntu/.certbot.
+set -euo pipefail
 
-#if you run it without the dirs, it will be in /etc/letsencrypt/live/rpc.eth.build
+CERT_NAME="mainnet.rpc.buidlguidl.com"
+CERTBOT_DIR="/home/ubuntu/.certbot"
+PROXY_DIR="/home/ubuntu/rpc-ssl-proxy"
+LOG="/var/log/rpc-ssl-renew.log"
+MIN_DAYS_LEFT=14
 
-sudo cp -f ~/.certbot/config/live/stage.mainnet.rpc.buidlguidl.com/privkey.pem server.key;sudo chmod 0777 server.key
-sudo cp -f ~/.certbot/config/live/stage.mainnet.rpc.buidlguidl.com/fullchain.pem server.cert;sudo chmod 0777 server.cert
+if [[ $EUID -ne 0 ]]; then
+  # sudo resets the environment, so FORCE has to be handed across explicitly or
+  # `FORCE=1 ./le.sh` would quietly perform an ordinary, non-forced run.
+  exec sudo -- env "FORCE=${FORCE:-0}" "$0" "$@"
+fi
+
+exec > >(tee -a "$LOG") 2>&1
+
+log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+renew_args=(
+  renew
+  --cert-name "$CERT_NAME"
+  --config-dir "$CERTBOT_DIR/config"
+  --logs-dir "$CERTBOT_DIR/logs"
+  --work-dir "$CERTBOT_DIR/work"
+  --deploy-hook "$PROXY_DIR/deploy-cert.sh"
+  -n
+)
+[[ "${FORCE:-0}" == "1" ]] && renew_args+=(--force-renewal)
+
+log "renewal check starting (force=${FORCE:-0})"
+
+if ! /usr/bin/certbot "${renew_args[@]}"; then
+  rc=$?
+  log "FAILED: certbot exited $rc -- see $CERTBOT_DIR/logs/letsencrypt.log"
+  exit "$rc"
+fi
+
+# certbot exits 0 both for "renewed" and "nothing to do", so check the cert we
+# are actually serving rather than trusting the exit code.
+if ! /usr/bin/openssl x509 -checkend $((MIN_DAYS_LEFT * 86400)) -noout \
+       -in "$PROXY_DIR/server.cert" >/dev/null; then
+  log "FAILED: $PROXY_DIR/server.cert expires within $MIN_DAYS_LEFT days and was not replaced"
+  exit 1
+fi
+
+log "OK: serving cert valid until $(/usr/bin/openssl x509 -enddate -noout -in "$PROXY_DIR/server.cert" | cut -d= -f2)"
