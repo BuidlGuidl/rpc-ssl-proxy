@@ -28,35 +28,50 @@ if [[ $EUID -ne 0 ]]; then
   exec sudo -- env "FORCE=${FORCE:-0}" "$0" "$@"
 fi
 
-exec > >(tee -a "$LOG") 2>&1
-
 log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
-renew_args=(
-  renew
-  --cert-name "$CERT_NAME"
-  --config-dir "$CERTBOT_DIR/config"
-  --logs-dir "$CERTBOT_DIR/logs"
-  --work-dir "$CERTBOT_DIR/work"
-  --deploy-hook "$PROXY_DIR/deploy-cert.sh"
-  -n
-)
-[[ "${FORCE:-0}" == "1" ]] && renew_args+=(--force-renewal)
+main() {
+  local renew_args=(
+    renew
+    --cert-name "$CERT_NAME"
+    --config-dir "$CERTBOT_DIR/config"
+    --logs-dir "$CERTBOT_DIR/logs"
+    --work-dir "$CERTBOT_DIR/work"
+    --deploy-hook "$PROXY_DIR/deploy-cert.sh"
+    -n
+  )
+  if [[ "${FORCE:-0}" == "1" ]]; then
+    renew_args+=(--force-renewal)
+  fi
 
-log "renewal check starting (force=${FORCE:-0})"
+  log "renewal check starting (force=${FORCE:-0})"
 
-if ! /usr/bin/certbot "${renew_args[@]}"; then
-  rc=$?
-  log "FAILED: certbot exited $rc -- see $CERTBOT_DIR/logs/letsencrypt.log"
-  exit "$rc"
-fi
+  # Take the status via `|| rc=$?`. Inside `if ! certbot ...` the then-branch
+  # sees $? from the negation, which is always 0, so certbot failing would be
+  # logged as FAILED and then still reported to systemd as a clean exit.
+  local rc=0
+  /usr/bin/certbot "${renew_args[@]}" || rc=$?
+  if (( rc != 0 )); then
+    log "FAILED: certbot exited $rc -- see $CERTBOT_DIR/logs/letsencrypt.log"
+    return "$rc"
+  fi
 
-# certbot exits 0 both for "renewed" and "nothing to do", so check the cert we
-# are actually serving rather than trusting the exit code.
-if ! /usr/bin/openssl x509 -checkend $((MIN_DAYS_LEFT * 86400)) -noout \
-       -in "$PROXY_DIR/server.cert" >/dev/null; then
-  log "FAILED: $PROXY_DIR/server.cert expires within $MIN_DAYS_LEFT days and was not replaced"
-  exit 1
-fi
+  # certbot exits 0 both for "renewed" and "nothing to do", so check the cert we
+  # are actually serving rather than trusting the exit code.
+  if ! /usr/bin/openssl x509 -checkend $((MIN_DAYS_LEFT * 86400)) -noout \
+         -in "$PROXY_DIR/server.cert" >/dev/null; then
+    log "FAILED: $PROXY_DIR/server.cert expires within $MIN_DAYS_LEFT days and was not replaced"
+    return 1
+  fi
 
-log "OK: serving cert valid until $(/usr/bin/openssl x509 -enddate -noout -in "$PROXY_DIR/server.cert" | cut -d= -f2)"
+  log "OK: serving cert valid until $(/usr/bin/openssl x509 -enddate -noout -in "$PROXY_DIR/server.cert" | cut -d= -f2)"
+}
+
+# A real pipeline, not `exec > >(tee -a "$LOG")`. Bash does not wait for a
+# process substitution to drain, so the closing OK/FAILED line was occasionally
+# lost when the script exited immediately after writing it.
+set +e
+main 2>&1 | tee -a "$LOG"
+rc=${PIPESTATUS[0]}
+set -e
+exit "$rc"
