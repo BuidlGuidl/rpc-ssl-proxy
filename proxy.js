@@ -14,7 +14,12 @@ import { checkRateLimit, buildRateLimitResponse, getRateLimitStatus, startRateLi
 import { validateRpcRequest } from './utils/requestValidator.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
-import { defaultRequestCount, methodRequestCounts } from './config.js';
+import { defaultRequestCount, methodRequestCounts, apiKeySignupUrl, getLogsMaxInFlightPerKey } from './config.js';
+import { resolveApiKey, startApiKeyPolling, getApiKeyStoreStatus } from './utils/apiKeys.js';
+import { consumeKeyUnits, acquireGetLogsSlots, releaseGetLogsSlots, getKeyRateLimitStatus } from './utils/keyRateLimiter.js';
+import { checkGetLogsParams } from './utils/getLogsGuard.js';
+import { getLatestBlock, startLatestBlockPolling, getLatestBlockStatus } from './utils/latestBlock.js';
+import { logRejectedRequest } from './utils/rejectLogger.js';
 
 var app = express();
 https.globalAgent.options.ca = sslRootCas.create();
@@ -95,6 +100,22 @@ function getOrigin(req) {
   }
 }
 
+// Weighted request units (heavy methods count for more; see config.methodRequestCounts)
+function weighRequests(requests) {
+  return requests.reduce((sum, r) => {
+    if (!r || typeof r.method !== 'string') return sum + defaultRequestCount;
+    return sum + (methodRequestCounts[r.method] ?? defaultRequestCount);
+  }, 0);
+}
+
+function maskKey(key) {
+  return typeof key === 'string' && key.length > 6 ? `${key.slice(0, 4)}…${key.slice(-2)}` : '******';
+}
+
+function buildRpcError(id, code, message) {
+  return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
+}
+
 // Helper function to make fallback requests with consistent settings
 async function makeFallbackRequest(data, headers) {
   if (!fallbackUrl || fallbackUrl.trim() === '') {
@@ -158,7 +179,7 @@ async function makePrimaryRequest(method, url, data, headers, timeout = 15000) {
   }
 }
 
-app.post("/", async (req, res) => {
+app.post(["/", "/v1/:key"], async (req, res) => {
   const clientIP = getClientIP(req);
   const origin = req.headers.origin;
   
@@ -183,39 +204,85 @@ app.post("/", async (req, res) => {
     return;
   }
   
-  // Block eth_getLogs - too resource-intensive to proxy
-  {
-    const requests = Array.isArray(req.body) ? req.body : [req.body];
-    const hasGetLogs = requests.some(r => r?.method === 'eth_getLogs');
-    if (hasGetLogs) {
-      const requestId = Array.isArray(req.body) ? (req.body[0]?.id ?? null) : (req.body?.id ?? null);
-      console.log(`🚫 Blocked eth_getLogs from ${clientIP}`);
+  // API key: `POST /v1/<key>` or an X-Api-Key header. A presented-but-bad key is
+  // refused outright. No key at all is the anonymous path, unchanged from before.
+  const apiKeyResult = resolveApiKey(req);
+  const apiKey = apiKeyResult.status === 'valid' ? apiKeyResult : null;
+  const requests = Array.isArray(req.body) ? req.body : [req.body];
+  const firstRequestId = requests[0]?.id ?? null;
+  if (apiKeyResult.status === 'invalid') {
+    console.log(`🔒 Rejected API key from ${clientIP}: ${apiKeyResult.reason}`);
+    logRejectedRequest(req, `invalid API key: ${apiKeyResult.reason}`);
+    res.status(401).json(buildRpcError(firstRequestId, -32001, 'Invalid API key'));
+    return;
+  }
+  const weightedUnits = weighRequests(requests);
+
+  // eth_getLogs: blocked without a key, bounded with one (range cap + concurrency cap).
+  const getLogsCalls = requests.filter(r => r?.method === 'eth_getLogs');
+  if (getLogsCalls.length > 0) {
+    if (!apiKey) {
+      console.log(`🚫 Blocked eth_getLogs from ${clientIP} (no API key)`);
+      logRejectedRequest(req, 'eth_getLogs without API key');
       res.status(429)
         .set('Retry-After', String(getSecondsUntilNextHour()))
+        .json(buildRpcError(firstRequestId, -32005, `eth_getLogs requires an API key. Get one at ${apiKeySignupUrl}`));
+      return;
+    }
+    const latest = getLatestBlock();
+    for (const call of getLogsCalls) {
+      const verdict = checkGetLogsParams(call.params, latest);
+      if (!verdict.ok) {
+        console.log(`🚫 Refused eth_getLogs for key ${maskKey(apiKey.key)}: ${verdict.message}`);
+        logRejectedRequest(req, `eth_getLogs refused: ${verdict.message}`);
+        res.status(200).json(buildRpcError(call.id ?? firstRequestId, -32602, verdict.message));
+        return;
+      }
+    }
+    if (!acquireGetLogsSlots(apiKey.key, getLogsCalls.length)) {
+      console.log(`🚫 Too many concurrent eth_getLogs for key ${maskKey(apiKey.key)}`);
+      res.status(429)
+        .set('Retry-After', '1')
+        .json(buildRpcError(firstRequestId, -32005, `Too many concurrent eth_getLogs for this API key (max ${getLogsMaxInFlightPerKey})`));
+      return;
+    }
+    let released = false;
+    const release = () => { if (!released) { released = true; releaseGetLogsSlots(apiKey.key, getLogsCalls.length); } };
+    res.once('finish', release);
+    res.once('close', release);
+  }
+
+  if (apiKey) {
+    // Keyed: charged up front against the per-key budget. IP/origin limits do not apply.
+    const budget = consumeKeyUnits(apiKey.key, weightedUnits);
+    if (budget.limited) {
+      console.log(`🚫 API key ${maskKey(apiKey.key)} over hourly budget (~${budget.effective}/${budget.limit} units)`);
+      res.status(429)
+        .set('Retry-After', String(budget.retryAfter))
+        .json(buildRateLimitResponse(firstRequestId));
+      return;
+    }
+  } else {
+    // Check rate limit before any other processing
+    const rateLimitResult = checkRateLimit(clientIP, origin);
+    if (rateLimitResult.limited) {
+      console.log(`🚫 Rate limited: ${rateLimitResult.reason}`);
+      
+      // Extract request ID from body (handle both single and batch requests)
+      let requestId = null;
+      if (req.body) {
+        if (Array.isArray(req.body) && req.body.length > 0) {
+          requestId = req.body[0]?.id ?? null;
+        } else {
+          requestId = req.body?.id ?? null;
+        }
+      }
+      
+      res.status(429)
+        .set('Retry-After', String(rateLimitResult.retryAfter || getSecondsUntilNextHour()))
         .json(buildRateLimitResponse(requestId));
       return;
     }
-  }
-
-  // Check rate limit before any other processing
-  const rateLimitResult = checkRateLimit(clientIP, origin);
-  if (rateLimitResult.limited) {
-    console.log(`🚫 Rate limited: ${rateLimitResult.reason}`);
-    
-    // Extract request ID from body (handle both single and batch requests)
-    let requestId = null;
-    if (req.body) {
-      if (Array.isArray(req.body) && req.body.length > 0) {
-        requestId = req.body[0]?.id ?? null;
-      } else {
-        requestId = req.body?.id ?? null;
-      }
-    }
-    
-    res.status(429)
-      .set('Retry-After', String(rateLimitResult.retryAfter || getSecondsUntilNextHour()))
-      .json(buildRateLimitResponse(requestId));
-    return;
   }
   
   const isUsingFallback = circuitBreaker.isCurrentlyUsingFallback();
@@ -233,8 +300,6 @@ app.post("/", async (req, res) => {
 
   // Handle method counting for both single requests and batch requests
   if (req.body) {
-    const requests = Array.isArray(req.body) ? req.body : [req.body];
-    
     requests.forEach(request => {
       if (request && request.method) {
         methods[request.method] = methods[request.method]
@@ -302,12 +367,7 @@ app.post("/", async (req, res) => {
   // Only count requests in Firebase if we successfully used primary URL (not fallback)
   if (!actuallyUsedFallback && responseData && req.headers) {
     // Weighted request count for rate limiting (heavy methods count for more)
-    const requests = Array.isArray(req.body) ? req.body : [req.body];
-    const requestCount = requests.reduce((sum, r) => {
-      if (!r || typeof r.method !== 'string') return sum + defaultRequestCount;
-      const weight = methodRequestCounts[r.method] ?? defaultRequestCount;
-      return sum + weight;
-    }, 0);
+    const requestCount = weightedUnits;
     if (requests.length > 1 || requestCount !== requests.length) {
       console.log(`Request count: ${requests.length} call(s) → ${requestCount} weighted unit(s)`);
     }
@@ -344,8 +404,6 @@ app.post("/", async (req, res) => {
 
   // Handle method counting for both single requests and batch requests
   if (req.body) {
-    const requests = Array.isArray(req.body) ? req.body : [req.body];
-    
     requests.forEach(request => {
       if (request && request.method) {
         methods[request.method] = methods[request.method]
@@ -521,6 +579,9 @@ app.get("/status", (req, res) => {
         primary: targetUrl,
         fallback: fallbackUrl
       },
+      apiKeys: getApiKeyStoreStatus(),
+      keyLimits: getKeyRateLimitStatus(),
+      latestBlock: getLatestBlockStatus(),
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -562,6 +623,13 @@ startBackgroundTasks();
 
 // Start rate limit polling
 startRateLimitPolling();
+
+// API keys (Firestore mirror) and the cached chain head the getLogs guard resolves tags against
+startApiKeyPolling();
+startLatestBlockPolling(async () => {
+  const r = await axios.post(targetUrl, { jsonrpc: "2.0", id: "proxy-head", method: "eth_blockNumber", params: [] }, { timeout: 5000, headers: { "content-type": "application/json" } });
+  return r.data?.result;
+});
 
 // Start IP blacklist watcher
 startWatchingBlacklist();

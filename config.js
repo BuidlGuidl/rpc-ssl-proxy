@@ -63,6 +63,22 @@ const methodRequestCounts = {
   eth_getBlockByHash: 2,
 };
 
+// =============================================================================
+// API KEYS
+// =============================================================================
+// Keys are minted by rpc-token-manager into Firestore (`rpcKeys<FIREBASE_COLLECTION>`).
+// A request carrying a valid key (`POST /v1/<key>` or `X-Api-Key` header) skips the
+// IP/origin limiter and is charged against a per-key budget instead, and may call
+// eth_getLogs within the bounds below. Requests without a key behave as before:
+// eth_getLogs stays blocked.
+// =============================================================================
+
+const apiKeyRefreshInterval = 60;        // Seconds between Firestore mirror refreshes
+const apiKeyRateLimitPerHour = 50000;    // Weighted units per key per rolling hour (charged up front)
+const getLogsMaxBlockRange = 2000;       // Max blocks a single keyed eth_getLogs may span
+const getLogsMaxInFlightPerKey = 2;      // Max concurrent eth_getLogs per key
+const apiKeySignupUrl = "https://rpc.buidlguidl.com"; // Shown in the no-key eth_getLogs error
+
 export {
   usdcAddress,
   // rpcFunderContractAddress,
@@ -74,5 +90,10 @@ export {
   ipRateLimitPerDay,
   rateLimitPollInterval,
   defaultRequestCount,
-  methodRequestCounts
+  methodRequestCounts,
+  apiKeyRefreshInterval,
+  apiKeyRateLimitPerHour,
+  getLogsMaxBlockRange,
+  getLogsMaxInFlightPerKey,
+  apiKeySignupUrl
 };

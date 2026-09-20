@@ -1,3 +1,10 @@
+# rpc-ssl-proxy
+
+Pre-proxy for mainnet.rpc.buidlguidl.com: request validation, IP blacklist,
+rate limiting, fallback switch, and API keys (see [API_KEYS.md](API_KEYS.md)).
+
+---
+
 UBUNTU RPC (scaffold-rpc)
 
 sudo add-apt-repository -y ppa:ethereum/ethereum
