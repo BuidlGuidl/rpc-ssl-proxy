@@ -21,8 +21,10 @@ Anonymous callers stay blocked from getLogs.
 
 > **⚠️ Likely root cause of slow and failing getLogs in production, and probably
 > hurting normal traffic today:** the pool's Socket.IO server uses the default
-> `maxHttpBufferSize` of **1 MB**. From reading the code (not yet confirmed in
-> production), any node response over ~1 MB **disconnects the node that served it**.
+> `maxHttpBufferSize` of **1 MB**. Established from the code of every layer
+> (buidlguidl-client → pool → engine.io → ws): any node response over ~1 MB
+> **disconnects the node that served it**. Production runs `main`, so this is the
+> live behavior.
 > The pool waits out its timeout, retries a second node (which also disconnects), and
 > bg-rpc-proxy finally serves the request from the paid fallback (Alchemy). This isn't
 > limited to getLogs: test 11 found **~25% of `eth_getBlockReceipts` responses exceed
@@ -391,10 +393,9 @@ Largest responses seen:
 | `eth_getBlockByNumber` | 25,541,701 | 1,057,087 | 958 transactions |
 
 - **About a quarter of `eth_getBlockReceipts` responses exceed 1,000,000 bytes**, the
-  pool's apparent Socket.IO message limit. Full blocks cross it occasionally. If the
-  limit is real, these requests fail today the same way large getLogs do (see
-  "Message size and compression findings"). This affects ordinary traffic,
-  especially indexers, not just getLogs.
+  pool's Socket.IO message limit. Full blocks cross it occasionally. These requests
+  fail today the same way large getLogs do (see "Message size and compression
+  findings"). This affects ordinary traffic, especially indexers, not just getLogs.
 - Nothing measured exceeded 2 MB. A `maxHttpBufferSize` of at least ~2–3 MB covers
   these methods with headroom; getLogs needs whatever its response cap allows.
 - Receipts take **~1,200 bytes per log**, about double getLogs' ~635. Receipts carry
@@ -672,19 +673,21 @@ deployed system.**
    as "slow" and removed from routing.
 
 This fits the production symptoms: getLogs of any real size takes 15+ s, succeeds
-eventually through the fallback, and hurts the pool along the way. If the limit is
-real, the same happens continuously to ~25% of `eth_getBlockReceipts` calls,
-inflating the fallback rate and node timeout rates.
+eventually through the fallback, and hurts the pool along the way. The same happens
+continuously to ~25% of `eth_getBlockReceipts` calls, inflating the fallback rate
+and node timeout rates.
 
-**Caveat:** the deployed pool may differ from GitHub. Ways to confirm:
-- **Fallback rate per method (the strongest check):** count methods in bg-rpc-proxy's
-  `/home/ubuntu/shared/fallbackRequests.log`. If `eth_getBlockReceipts` falls back far
-  more often than similar small methods such as `eth_getTransactionReceipt`, that's
-  the 1 MB limit. Unlike the getLogs spam, this would be happening continuously.
+**The chain is established from code at every layer.** The node returns the full
+result as one Socket.IO ack (`webSocketConnection.js` ~line 181, no size options on
+the client); the pool sets no `maxHttpBufferSize`; engine.io defaults it to `1e6`
+and applies it on both the WebSocket (`ws` `maxPayload`, fragments summed) and
+polling transports; `ws` closes with code 1009. Production runs `main`, so this is
+the live behavior. Useful production signals, as before/after numbers for the fix:
+- fallback count per method in bg-rpc-proxy's
+  `/home/ubuntu/shared/fallbackRequests.log` (`eth_getBlockReceipts` should be far
+  above `eth_getTransactionReceipt` today, and drop after the fix)
 - timeout rates per method in the pool's `poolNodes.log`
-- `timeout_error` entries in the pool logs on nodes that reconnect shortly afterwards
-- a "disconnect" message in a buidlguidl-client debug log right after a large
-  response
+- `timeout_error` entries followed by reconnects from the same node
 
 ### Cost of large responses under load
 
@@ -1013,15 +1016,10 @@ Knock-on effects:
 
 ### To confirm (verify the code-reading findings in production)
 
-- [ ] **The 1 MB limit, the most important check.** If real, it affects ~25% of
-  `eth_getBlockReceipts` calls today, not just getLogs. In order of usefulness:
-  - count fallbacks per method in bg-rpc-proxy's
-    `/home/ubuntu/shared/fallbackRequests.log`: is `eth_getBlockReceipts` far above
-    similar small methods like `eth_getTransactionReceipt`?
-  - check the deployed pool's Socket.IO options for `maxHttpBufferSize`
-  - timeout rates per method in the pool's `poolNodes.log`, and timeouts followed by
-    reconnects from the same node
-  - a disconnect in a buidlguidl-client debug log right after a large response
+- [ ] **Baseline before the 1 MB fix.** The limit is established (production runs
+  `main`; see "Message size and compression findings"). Record the per-method
+  fallback counts from `/home/ubuntu/shared/fallbackRequests.log` before Phase 1a
+  ships, so the drop can be measured.
 - [ ] **Production `TARGET_URL`:** this machine's `.env` points to
   `stage.rpc.buidlguidl.com:48544`. Confirm that production points to bg-rpc-proxy
   the same way.
