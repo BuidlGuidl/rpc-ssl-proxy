@@ -4,7 +4,8 @@ Tests run 2026-09-22 against one production reth node, direct (not through the p
 or load balancer), from a separate machine on the same LAN. No host metrics were
 available; everything was measured over RPC. Code review of the downstream services
 (bg-rpc-proxy, bg-rpc-pool, buidlguidl-client) done 2026-09-23 by reading their code,
-not by testing.
+not by testing. A second round of tests on the same node (tests 11–13: response sizes
+of block-level methods, compression ratios, error codes) ran 2026-09-23.
 
 Request chain: **this proxy (edge) → bg-rpc-proxy → bg-rpc-pool → volunteer nodes**
 (over Socket.IO).
@@ -16,13 +17,15 @@ Anonymous callers stay blocked from getLogs.
 
 ## Overall summary
 
-> **⚠️ Likely root cause of slow and failing getLogs in production:** the pool's
-> Socket.IO server uses the default `maxHttpBufferSize` of **1 MB**. From reading the
-> code (not tested yet), any node response over ~1 MB, e.g. ~10 blocks of USDC logs,
-> **disconnects the node that served it**. The pool then waits out its 10 s timeout,
-> retries a second node (which also disconnects), and bg-rpc-proxy finally serves the
-> query from the paid fallback after 15 s. Nothing in the chain compresses anything.
-> See "Message size and compression findings".
+> **⚠️ Likely root cause of slow and failing getLogs in production, and probably
+> hurting normal traffic today:** the pool's Socket.IO server uses the default
+> `maxHttpBufferSize` of **1 MB**. From reading the code (not yet confirmed in
+> production), any node response over ~1 MB **disconnects the node that served it**.
+> The pool waits out its timeout, retries a second node (which also disconnects), and
+> bg-rpc-proxy finally serves the request from the paid fallback (Alchemy). This isn't
+> limited to getLogs: test 11 found **~25% of `eth_getBlockReceipts` responses exceed
+> 1 MB**. Nothing in the chain compresses anything, although test 12 showed responses
+> compress ~9–10×. See "Message size and compression findings".
 
 1. **Cost is driven by block range, not result count.** Reth scans every block in the
    range whether or not anything matches: ~0.05–0.1 ms per block. A zero-result query
@@ -59,15 +62,28 @@ Anonymous callers stay blocked from getLogs.
    bg-rpc-pool showed that timeouts don't line up across the layers (pool 10 s plus a
    second-node retry; bg-rpc-proxy 15 s plus a fallback; this proxy 15 s plus a
    fallback). One slow getLogs can run on 2 volunteer nodes and 2 paid fallback
-   providers. bg-rpc-proxy also sends node errors like "exceeds max results" to the
-   fallback, which bypasses the node caps. Together with the 1 MB message limit
-   (point 10), this is the most likely reason production getLogs took over 15 s.
+   providers. Reth's cap *errors* are returned to the caller, not retried (point
+   11), but anything that *times out* still ends up at the fallback. Together with
+   the 1 MB message limit (point 10), this is the most likely reason production
+   getLogs took over 15 s.
 10. **The node-to-pool link can't carry responses over 1 MB, and nothing is
     compressed.** Fixing the 1 MB limit is required before the pool can serve getLogs
-    at all. Even then, 16 MB responses under load would make the Node processes
-    (memory, JSON parsing, volunteer upload) the bottleneck before reth. A lower log
-    cap (~5,000 logs, ~3–3.5 MB) and compression on the Socket.IO link are
-    recommended.
+    at all, and it likely affects ~25% of `eth_getBlockReceipts` calls today (test
+    11). Compression works very well on this data: **~9–10× for logs and receipts,
+    ~5× for full blocks**, at a cost of tens of ms (test 12). That largely removes the
+    volunteer upload cost (an 8.9 MB response: 7.1 s raw vs 0.75 s compressed at
+    10 Mbps). It doesn't reduce memory and JSON parsing in the Node processes, which
+    still handle the full uncompressed size, so a lower log cap (~5,000 logs,
+    ~3–3.5 MB) is still worth considering.
+11. **Reth's cap rejections reach the caller; timeouts don't.** Reth reports all of
+    its getLogs limit errors with code `-32602` ("Invalid params"), the same code as
+    malformed input (test 13). **`-32602` is in bg-rpc-proxy's `ignoredErrorCodes`**
+    (confirmed), so these rejections go straight back to the caller and are never
+    retried on the paid fallback. The node caps work as intended. The remaining route
+    to the fallback is **timeouts**: a query under the caps but slow enough to time
+    out (e.g. a sparse scan of 100k blocks, 6–11 s against the pool's 10 s timeout),
+    or any response over 1 MB (point 10). Telling "too large" apart from "malformed"
+    requires matching the error message.
 
 ### Recommended settings (proposed)
 
@@ -75,14 +91,14 @@ Anonymous callers stay blocked from getLogs.
 |---|---|---|
 | Proxy block-range cap (keyed getLogs) | **10,000 blocks** | worst observed ~1.6 s cold |
 | Reth `--rpc.max-blocks-per-filter` | **10,000** (backstop; default 100,000) | stops the 6–11 s scans of 100k blocks |
-| Reth `--rpc.max-logs-per-response` | consider **~5,000** (default 20,000) | fails fast either way; 5,000 logs is ~3–3.5 MB instead of ~12.5–14 MB, which the chain handles far better (see "Message size and compression findings"). Applies to every getLogs on the node. |
+| Reth `--rpc.max-logs-per-response` | consider **~5,000** (default 20,000) | fails fast either way; 5,000 logs is ~3–3.5 MB instead of ~12.5–14 MB. With compression the upload cost is small either way, so the remaining reason is memory and JSON parsing in the Node processes (see "Message size and compression findings"). Applies to every getLogs on the node. |
 | Lower block limit | reject `fromBlock < L` per node; find L by binary search on `eth_getBlockReceipts` (~19 calls) | reth returns silent `[]` below L |
 | getLogs concurrency per reth node | **~4** (enforced by the pool) | the tested node's throughput levels off at 8; ~4 leaves headroom for weaker volunteer hardware and older reth versions |
 | Per-key concurrency | **2** | |
 | Metering unit | ~1 unit per 100 blocks in the range (10k blocks = 100 units, the current `eth_getLogs` weight), minimum ~5 | cost follows range; range is known before forwarding |
 | Proxy response size cap | **~16 MB** at 20k logs, or **~5 MB** with a 5,000-log cap | largest observed 12.5 MB at the 20k-log cap |
-| Pool Socket.IO `maxHttpBufferSize` | raise from the **1 MB default** to just above the largest allowed response | **required**: larger responses currently disconnect the node |
-| Pool Socket.IO `perMessageDeflate` | **enable** | node clients already offer it; cuts volunteer upload time |
+| Pool Socket.IO `maxHttpBufferSize` | raise from the **1 MB default** to just above the largest allowed response (at least ~2–3 MB for block receipts; more if getLogs is allowed larger responses) | **required**: larger responses currently disconnect the node. Receipts measured up to 1.7 MB, full blocks up to 1.3 MB (test 11). |
+| Pool Socket.IO `perMessageDeflate` | **enable** | node clients already offer it; measured ~9–10× on logs and receipts, ~5× on full blocks, for tens of ms (test 12) |
 | getLogs per batch | **≤ ~5**, each charged separately; also cap total batch length for all callers | batches run sequentially; reth accepted 1,000 |
 | Edge proxy timeout | normal 15 s is fine once the range cap is in place, as long as the downstream timeouts are shorter (see "Timeouts across layers") | slowest 10k query ~1.6 s |
 | Circuit breaker / fallback | getLogs **excluded** from breaker accounting; **no** fallback retry | avoid pushing everyone onto the fallback |
@@ -92,7 +108,7 @@ Anonymous callers stay blocked from getLogs.
 | Pool: 3-node comparison | **exclude getLogs** (add it to `methodsToSkipComparison`) | 1 in 20 getLogs currently runs on 3 nodes |
 | Pool: getLogs timeout | **~5 s** (currently 10 s) | slowest 10k-block query ~1.6 s |
 | Pool: routing | load-aware for **all** requests (power of two choices on weighted in-flight counts); getLogs additionally restricted to reth nodes whose L covers the range; at most ~4 getLogs per node | see "Pool routing design (proposed)" |
-| bg-rpc-proxy: fallback | **never** send getLogs to the fallback; return node errors (e.g. "exceeds max results") to the caller | otherwise node caps are bypassed through the paid provider |
+| bg-rpc-proxy: fallback | **never** send getLogs to the fallback, including after a timeout | reth's cap errors (`-32602`) already go back to the caller, since that code is in `ignoredErrorCodes`. Timeouts still fall back, so slow under-cap queries and responses over 1 MB end up at the paid provider. |
 | bg-rpc-proxy: batches | cap batch length | items run one after another, with no limit |
 | Timeouts across layers | make them agree: each layer's timeout longer than the layer below's total, retries included | currently each layer gives up while the one below is still retrying |
 | Header forwarding | strip client headers at the edge | bg-rpc-proxy forwards headers to the fallback provider, so an API key would leak |
@@ -154,7 +170,8 @@ not stop that work.
   - `max-tracing-requests` 14, which suggests ~16 cores
 - HTTP API namespaces: `eth,net,admin`, on `0.0.0.0` with CORS `*`.
 - Network round trip from the test machine: median 4–5 ms.
-- HEAD at test time: ~26,034,960.
+- HEAD at test time: ~26,034,960 (tests 0–10); 26,041,714 (tests 11–12). Test 13
+  sent no requests; it read the saved results of the earlier runs.
 - Windows used:
   - **R (recent):** ranges ending at HEAD − 100
   - **O (old):** ranges ending at HEAD − 500,000
@@ -188,7 +205,7 @@ not stop that work.
 
 - USDC averages ~100–140 logs per block, so it hits the 20k cap at ~150–200 blocks.
 - Hitting the cap **costs less than a large successful query**, so reth stops early.
-  The error suggests a smaller range to retry, e.g.
+  The error (code `-32602`) suggests a smaller range to retry, e.g.
   `query exceeds max results 20000, retry with the range 26034661-26034819`.
 - ~635 bytes per log, so a response at the cap is ~12.5 MB.
 - Little cold/warm difference (ratio 1.03 in R, 1.19 in O).
@@ -235,19 +252,22 @@ not stop that work.
 
 ### 6. Edge cases (test 5)
 
-| case | reth behavior |
-|---|---|
-| Range entirely below L (5b) | **`[]`, no error** |
-| Range straddling L (5a, USDC) | hit the 20k-log cap first, so partial behavior is untested (the retry hint started below L) |
-| `toBlock` above head (5c) | error: `block range extends beyond current head block` |
-| `from > to` (5e) | error: `invalid block range params` |
-| `earliest` → `latest` (5f) | error in 7 ms: `query exceeds max block range 100000`, rejected before scanning |
-| `safe`/`safe`, `finalized`→`latest`, `pending`/`pending`, both omitted | work as expected |
-| `fromBlock` omitted (= latest), `toBlock` in the past (5k) | error: `invalid block range params` |
-| `blockHash` alone (5l) | works |
-| `blockHash` + range (5m) | `Invalid params` |
-| `blockHash` of a block below L (5n) | error: `block not found`, **even though the block itself exists** |
-| Zero hash, malformed hex, decimal number, bad address | errors (`block not found` / `Invalid params`) |
+Error codes come from test 13.
+
+| case | reth behavior | code |
+|---|---|---|
+| Range entirely below L (5b) | **`[]`, no error** | — |
+| Range straddling L (5a, USDC) | hit the 20k-log cap first, so partial behavior is untested (the retry hint started below L) | `-32602` |
+| `toBlock` above head (5c) | error: `block range extends beyond current head block` | `-32602` |
+| `from > to` (5e) | error: `invalid block range params` | `-32602` |
+| `earliest` → `latest` (5f) | error in 7 ms: `query exceeds max block range 100000`, rejected before scanning | `-32602` |
+| `safe`/`safe`, `finalized`→`latest`, `pending`/`pending`, both omitted | work as expected | — |
+| `fromBlock` omitted (= latest), `toBlock` in the past (5k) | error: `invalid block range params` | `-32602` |
+| `blockHash` alone (5l) | works | — |
+| `blockHash` + range (5m) | `Invalid params` | `-32602` |
+| `blockHash` of a block below L (5n) | error: `block not found`, **even though the block itself exists** | `-32001` |
+| Zero hash (5o) | error: `block not found` | `-32001` |
+| Malformed hex, decimal number, bad address (5p–5r) | `Invalid params` | `-32602` |
 
 5d (`fromBlock` HEAD + 10) returned data only because the chain advanced during the
 run. That's not a bug.
@@ -346,6 +366,96 @@ H: ENS, 100k-block range, ~10.4 s alone. 8 copies were sent at once. Probe P (US
   seemed: the pool reaches nodes only over their own outbound Socket.IO session, so
   this only matters for operators who port-forward 8545 themselves (see "Load
   balancer (bg-rpc-pool) findings", point 6).
+
+### 12. Response sizes of block-level methods (test 11)
+
+Recent pass: 200 blocks ending at HEAD − 1. Old pass: 50 blocks ending at
+HEAD − 500,000.
+
+| method | pass | p50 | p95 | max | > 512 KB | **> 1 MB** | > 2 MB |
+|---|---|---|---|---|---|---|---|
+| `eth_getBlockReceipts` | recent | 809 KB | 1.29 MB | 1.60 MB | 89.5% | **25%** | 0% |
+| `eth_getBlockReceipts` | old | 638 KB | 1.60 MB | 1.71 MB | 76% | **20%** | 0% |
+| `eth_getBlockByNumber(…, true)` | recent | 538 KB | 858 KB | 1.30 MB | 56.5% | **0.5%** | 0% |
+| `eth_getBlockByNumber(…, true)` | old | 407 KB | 1.02 MB | 1.06 MB | 32% | **6%** | 0% |
+
+Largest responses seen:
+
+| method | block | bytes | contents |
+|---|---|---|---|
+| `eth_getBlockReceipts` | 25,541,714 | 1,706,287 | 420 receipts, 1,702 logs |
+| `eth_getBlockReceipts` | 26,041,709 | 1,601,345 | 644 receipts, 1,368 logs |
+| `eth_getBlockByNumber` | 26,041,709 | 1,303,741 | 644 transactions |
+| `eth_getBlockByNumber` | 25,541,701 | 1,057,087 | 958 transactions |
+
+- **About a quarter of `eth_getBlockReceipts` responses exceed 1,000,000 bytes**, the
+  pool's apparent Socket.IO message limit. Full blocks cross it occasionally. If the
+  limit is real, these requests fail today the same way large getLogs do (see
+  "Message size and compression findings"). This affects ordinary traffic,
+  especially indexers, not just getLogs.
+- Nothing measured exceeded 2 MB. A `maxHttpBufferSize` of at least ~2–3 MB covers
+  these methods with headroom; getLogs needs whatever its response cap allows.
+- Receipts take **~1,200 bytes per log**, about double getLogs' ~635. Receipts carry
+  extra fields per transaction, and every log repeats some of them.
+
+### 13. Compression ratios (test 12)
+
+Each response body was compressed with raw deflate, the algorithm WebSocket
+`permessage-deflate` uses, then discarded. Times were measured on the test machine
+and are indicative only.
+
+| response | raw | level 1 | level 6 | level 9 | level 6 ratio | level 6 time |
+|---|---|---|---|---|---|---|
+| getLogs, USDC (14,000 logs) | 8.89 MB | 1.02 MB | 0.94 MB | 0.92 MB | **9.4×** | 42 ms |
+| getLogs, no filter, 10 blocks (6,444 logs) | 5.03 MB | 567 KB | 498 KB | 474 KB | **10.1×** | 24 ms |
+| getLogs, ENS, 10k blocks (1,154 logs) | 687 KB | 97 KB | 89 KB | 87 KB | 7.7× | 6 ms |
+| `eth_getBlockReceipts` (272 receipts) | 682 KB | 83 KB | 69 KB | 65 KB | **10.0×** | 8 ms |
+| `eth_getBlockByNumber`, full (272 txs) | 399 KB | 90 KB | 82 KB | 81 KB | 4.9× | 9 ms |
+
+(The USDC query was specified as 150 blocks, retrying at 100 if it hit the 20k-log
+cap. The summary doesn't say which ran; 14,000 logs matches ~100 blocks in test 1.
+The ratio is what matters here, not the range.)
+
+Upload time for the 8.89 MB USDC response:
+
+| upload speed | raw | level 6 |
+|---|---|---|
+| 10 Mbps | 7.1 s | **0.75 s** |
+| 50 Mbps | 1.4 s | **0.15 s** |
+
+- Logs and receipts compress **~9–10×**; full blocks ~5×. Level 1 already gets most of
+  the benefit at roughly half the time of level 6.
+- **Compression largely removes the volunteer upload cost**, which was the slowest
+  step for large responses.
+- **It doesn't reduce memory or parsing work.** Every Node process in the chain still
+  decompresses, parses and re-serializes the full uncompressed response.
+- **It doesn't work around the 1 MB limit:** `ws` checks message size after
+  decompressing. The USDC response compresses to 941 KB but would still be rejected
+  as 8.9 MB.
+
+### 14. Error codes (test 13)
+
+Taken from the saved results of all earlier runs; no new requests were sent.
+
+| code | message (normalized) | seen in |
+|---|---|---|
+| `-32602` | `query exceeds max results <n>, retry with the range <n>-<n>` | tests 1, 3 (21 times) |
+| `-32602` | `query exceeds max block range <n>` | 5f |
+| `-32602` | `block range extends beyond current head block: requested <n>, head <n>` | 5c |
+| `-32602` | `invalid block range params` | 5e, 5k |
+| `-32602` | `Invalid params` | 5m, 5p, 5q, 5r |
+| `-32001` | `block not found: hash <hash>` | 5n, 5o |
+| `-32601` | `Method not found` | 10b, 10c |
+
+- **Every getLogs limit error uses `-32602`**, the generic JSON-RPC "Invalid params"
+  code, the same as malformed input.
+- **The code alone can't tell "too large" from "malformed."** Any layer that needs the
+  difference (e.g. to never retry "too large") has to match on the message.
+- **`-32602` is in bg-rpc-proxy's `ignoredErrorCodes`** (confirmed), so reth's cap
+  rejections, and malformed requests, go back to the caller and are never retried
+  on the paid fallback (see bg-rpc-proxy finding 3).
+- For the edge proxy's own "range too large" errors, `-32602` with a clear message
+  matches reth.
 
 ---
 
@@ -468,12 +578,21 @@ paid compute units.
    Result: one slow query can run on **2 volunteer nodes and 2 paid fallback
    providers**, and the user still sees a timeout or a slow result. **This is the
    best explanation so far for production getLogs taking over 15 s.**
-3. **Reth's getLogs caps are bypassed by the fallback.** In bg-rpc-proxy, **any** pool
-   error whose code isn't in `ignoredErrorCodes` goes to the fallback provider. When
-   reth correctly rejects a query with "query exceeds max results 20000", bg-rpc-proxy
-   sends the same query to the paid fallback. Unless reth's error code is in
-   `ignoredErrorCodes` (a shared file, not in the repo, not checked), node-side caps
-   don't protect anything: the query goes to the paid provider, which may serve it.
+3. **Reth's cap rejections are respected, but timeouts still go to the fallback.** In
+   bg-rpc-proxy, any pool error whose code isn't in `ignoredErrorCodes` goes to the
+   fallback provider. Reth uses code **`-32602`** for all its getLogs limit errors
+   and for malformed input (detailed finding 14), and **`-32602` is in
+   `ignoredErrorCodes`** (confirmed on the bg-rpc-proxy host). So when reth rejects a
+   query with "query exceeds max results 20000", the rejection goes straight back to
+   the caller and is not retried on the paid fallback. The pool doesn't retry these
+   either: it only retries a second node after a timeout.
+
+   **The gap is timeouts.** A timeout isn't an error code from the node, so it always
+   falls through to the fallback. The queries most likely to time out are exactly the
+   expensive ones the caps *don't* catch: a sparse scan of 100k blocks is within
+   reth's default block cap and takes 6–11 s, against the pool's 10 s getLogs
+   timeout. Responses over 1 MB also end as timeouts (see "Message size and
+   compression findings"). Those requests end up at Alchemy.
 4. **Every failure sends a Telegram alert** with the full request and response JSON.
    During a getLogs flood, that's an alert per failed request.
 5. **Large responses are parsed and serialized over and over.** A ~12.5 MB result is
@@ -493,9 +612,9 @@ paid compute units.
   enter the chain. Everything downstream turns one expensive request into several.
   Strip client headers before forwarding.
 - **bg-rpc-proxy:**
-  - never send getLogs to the fallback
-  - pass node errors like "exceeds max results" straight back to the caller instead
-    of retrying
+  - never send getLogs to the fallback, **including after a timeout** (node
+    errors like "exceeds max results" are already passed straight back, since
+    `-32602` is in `ignoredErrorCodes`)
   - cap batch length
 - **All three layers:** agree on timeouts. Currently each layer's timeout fires while
   the layer below is still retrying (pool 10 s + retry; bg-rpc-proxy 15 s + 10 s
@@ -534,33 +653,43 @@ deployed system.**
 - From the test data, 1 MB is roughly:
   - ~10 blocks of USDC logs (910 KB)
   - ~1 block of unfiltered logs (660 KB–1.1 MB)
-  - probably some `eth_getBlockReceipts` and full `eth_getBlockByNumber` calls on
-    busy blocks (not measured)
+  - **a quarter of all `eth_getBlockReceipts` responses** exceed it, and a few full
+    `eth_getBlockByNumber` responses (detailed finding 12)
 
-**What a getLogs over 1 MB then does (from reading the code):**
-1. Node 1 runs the query, sends the result, and gets disconnected. Every other
+**What a response over 1 MB then does (from reading the code):**
+1. Node 1 runs the request, sends the result, and gets disconnected. Every other
    request in flight on that node is lost too.
-2. The pool hears nothing back, waits the full **10 s** timeout, then retries
-   **node 2**, which gets disconnected the same way.
-3. bg-rpc-proxy gives up at 15 s and sends the query to the **paid fallback**, which
-   serves it.
+2. The pool hears nothing back and waits for the method's timeout (**10 s** for
+   getLogs, **2 s** for `eth_getBlockReceipts`), then retries **node 2**, which gets
+   disconnected the same way.
+3. bg-rpc-proxy sends the request to the **paid fallback** (Alchemy), which serves it.
+   For getLogs this happens when bg-rpc-proxy's 15 s timeout runs out; for receipts,
+   as soon as the pool reports the failure.
 4. Both nodes reconnect after about 10 s (`reconnectionDelay: 10000`). The timeouts
    count against their weekly timeout rate, which can get healthy nodes classified
    as "slow" and removed from routing.
 
 This fits the production symptoms: getLogs of any real size takes 15+ s, succeeds
-eventually through the fallback, and hurts the pool along the way.
+eventually through the fallback, and hurts the pool along the way. If the limit is
+real, the same happens continuously to ~25% of `eth_getBlockReceipts` calls,
+inflating the fallback rate and node timeout rates.
 
-**Caveat:** the deployed pool may differ from GitHub. To confirm, look for:
-- `timeout_error` entries for `eth_getLogs` in the pool logs, on nodes that
-  reconnect shortly afterwards
-- a "disconnect" message in a buidlguidl-client debug log right after a large getLogs
+**Caveat:** the deployed pool may differ from GitHub. Ways to confirm:
+- **Fallback rate per method (the strongest check):** count methods in bg-rpc-proxy's
+  `/home/ubuntu/shared/fallbackRequests.log`. If `eth_getBlockReceipts` falls back far
+  more often than similar small methods such as `eth_getTransactionReceipt`, that's
+  the 1 MB limit. Unlike the getLogs spam, this would be happening continuously.
+- timeout rates per method in the pool's `poolNodes.log`
+- `timeout_error` entries in the pool logs on nodes that reconnect shortly afterwards
+- a "disconnect" message in a buidlguidl-client debug log right after a large
+  response
 
 ### Cost of large responses under load
 
 Even with the 1 MB limit raised, at each hop a 16 MB response gets:
 - **Transferred:** over a volunteer's home upload, ~13 s at 10 Mbps with no
-  compression. Usually the slowest step.
+  compression. Usually the slowest step today. With compression (~9–10× on logs,
+  test 12), this drops to ~1.4 s.
 - **Held in memory several times:** raw text plus parsed JavaScript objects (several
   times the JSON size), roughly **50–100 MB of temporary memory per response per
   process**, in this proxy, bg-rpc-proxy and the pool alike.
@@ -575,20 +704,23 @@ consistent with reth having plenty of headroom in the tests.
 
 ### Recommendations
 
-1. **Required before getLogs can go through the pool at all:** set
-   `maxHttpBufferSize` on the pool's Socket.IO server just above the largest
-   allowed response. Also check how the current 1 MB limit affects
-   `eth_getBlockReceipts` and full blocks today.
+1. **Required, and worth doing now regardless of getLogs:** set `maxHttpBufferSize`
+   on the pool's Socket.IO server just above the largest allowed response. At least
+   ~2–3 MB for block receipts and full blocks (measured up to 1.7 MB); more if getLogs
+   is allowed larger responses.
 2. **Lower the response size rather than planning for 16 MB.** For example,
    reth `--rpc.max-logs-per-response 5000` brings the typical worst case to
-   ~3–3.5 MB: 4× less memory, parsing and upload time per response. Clients split
-   on the error anyway. This applies to every getLogs on those nodes; the edge
+   ~3–3.5 MB: 4× less memory and parsing per response. With compression, upload time
+   is no longer the main reason; memory and CPU in the Node processes are. Clients
+   split on the error anyway. This applies to every getLogs on those nodes; the edge
    proxy could enforce its own lower limit instead.
 3. **Enable `perMessageDeflate` on the pool's Socket.IO server.** Node clients
-   already offer it. Hex-heavy JSON should compress several times over, which cuts
-   volunteer upload time directly. zlib runs on Node's thread pool, so it adds little
-   event-loop blocking. The size limit applies to the uncompressed size, so this
-   doesn't replace item 1. Measure the ratio first by gzipping a saved response.
+   already offer it. Measured ratios are ~9–10× for logs and receipts and ~5× for
+   full blocks, for tens of ms of compression time (test 12). Level 1 gets most of
+   the benefit at about half the cost of level 6. zlib runs on Node's thread pool, so
+   it adds little event-loop blocking, and each connection's zlib state costs little
+   memory with ~16 nodes. The size limit applies to the uncompressed size, so this
+   doesn't replace item 1.
 4. **Compression at the edge (client ↔ this proxy)** is optional. It helps clients
    on slow connections but doesn't relieve the internal chain.
 
@@ -612,8 +744,9 @@ keys and metering live), before anything reaches the pool.
   range errors and split on their own. Providers like Alchemy reject with a message
   suggesting a working range, and some libraries parse it and retry automatically.
   **Copy that convention:** state the max range and a suggested `[fromBlock, toBlock]`
-  in the error (like reth's `retry with the range X-Y`). Check which formats viem,
-  ethers and ponder actually parse before settling on wording.
+  in the error (like reth's `retry with the range X-Y`), with code `-32602` as reth
+  uses. Check which formats and codes viem, ethers and ponder actually parse before
+  settling on wording.
 - **Metering stays simple:** one request, one range, one charge.
 
 ### Where each limit belongs
@@ -621,6 +754,7 @@ keys and metering live), before anything reaches the pool.
 - **Edge proxy (this repo):** keys, metering, the 10k-block cap (reject, with a
   suggested range), the lower block limit, batch limits, the response size cap.
 - **Pool (bg-rpc-pool):**
+  - raise the Socket.IO `maxHttpBufferSize` and enable `perMessageDeflate`
   - no second-node retry for getLogs
   - no 3-node comparison for getLogs
   - a getLogs timeout matched to the cap (~5 s)
@@ -773,16 +907,15 @@ Each step can be released and checked on its own:
 
 ### To confirm (verify the code-reading findings in production)
 
-- [ ] **The 1 MB limit, the most important check:**
+- [ ] **The 1 MB limit, the most important check.** If real, it affects ~25% of
+  `eth_getBlockReceipts` calls today, not just getLogs. In order of usefulness:
+  - count fallbacks per method in bg-rpc-proxy's
+    `/home/ubuntu/shared/fallbackRequests.log`: is `eth_getBlockReceipts` far above
+    similar small methods like `eth_getTransactionReceipt`?
   - check the deployed pool's Socket.IO options for `maxHttpBufferSize`
-  - look in the pool logs for `eth_getLogs` `timeout_error` entries followed by
+  - timeout rates per method in the pool's `poolNodes.log`, and timeouts followed by
     reconnects from the same node
-  - look for a disconnect in a buidlguidl-client debug log right after a large
-    response
-- [ ] **`ignoredErrorCodes`:** check whether reth's "exceeds max results" and "max
-  block range" error codes are in the shared `ignoredErrorCodes` file (on the
-  bg-rpc-proxy / pool host; not on this machine). If not, bg-rpc-proxy sends those
-  queries to the paid fallback.
+  - a disconnect in a buidlguidl-client debug log right after a large response
 - [ ] **Production `TARGET_URL`:** this machine's `.env` points to
   `stage.rpc.buidlguidl.com:48544`. Confirm that production points to bg-rpc-proxy
   the same way.
@@ -791,11 +924,6 @@ Each step can be released and checked on its own:
 
 ### To measure
 
-- [ ] **Other methods over 1 MB:** measure `eth_getBlockReceipts` and full
-  `eth_getBlockByNumber` sizes on busy blocks. If they exceed 1 MB, they're affected
-  by the Socket.IO limit today too.
-- [ ] **Compression ratio:** gzip one saved large getLogs response to measure what
-  `perMessageDeflate` would save.
 - [ ] **Receipt `null` bug on other clients:** compare `eth_getTransactionReceipt` for
   transactions older than L on geth and Nethermind. Decide whether to route
   old-receipt requests away from reth.
@@ -808,7 +936,9 @@ Each step can be released and checked on its own:
 
 ### To decide
 
-- [ ] **Log cap:** keep 20,000 logs per response, or drop to ~5,000.
+- [ ] **Log cap:** keep 20,000 logs per response, or drop to ~5,000. With compression
+  the upload cost is small either way; the deciding factor is memory and JSON
+  parsing in the Node processes.
 - [ ] **buidlguidl-client flags:** set `--rpc.max-blocks-per-filter` and
   `--rpc.max-logs-per-response` explicitly for all client users, or only for pool
   nodes?
@@ -835,3 +965,12 @@ Each step can be released and checked on its own:
   behavior.
 - [x] **L on other reth nodes:** each node's L depends on its snapshot, so it will
   differ. Handled by the L decision above.
+- [x] **Other methods over 1 MB:** yes. ~25% of `eth_getBlockReceipts` responses and a
+  few full blocks exceed 1 MB; nothing measured exceeded 2 MB (detailed finding 12).
+- [x] **Compression ratio:** ~9–10× for logs and receipts, ~5× for full blocks, for
+  tens of ms (detailed finding 13).
+- [x] **Reth's error codes:** `-32602` for every getLogs limit error and malformed
+  input; `-32001` for "block not found" (detailed finding 14).
+- [x] **`ignoredErrorCodes`:** `-32602` is in the shared file, so reth's cap
+  rejections go back to the caller and are never sent to the fallback. Timeouts
+  still are (bg-rpc-proxy finding 3).
