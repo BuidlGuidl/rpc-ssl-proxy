@@ -2,7 +2,12 @@
 
 Tests run 2026-09-22 against one production reth node, direct (not through the proxy
 or load balancer), from a separate machine on the same LAN. No host metrics were
-available; everything was measured over RPC.
+available; everything was measured over RPC. Code review of the downstream services
+(bg-rpc-proxy, bg-rpc-pool, buidlguidl-client) done 2026-09-23 by reading their code,
+not by testing.
+
+Request chain: **this proxy (edge) → bg-rpc-proxy → bg-rpc-pool → volunteer nodes**
+(over Socket.IO).
 
 Purpose: inform the design of keyed (API key) `eth_getLogs` access with metering.
 Anonymous callers stay blocked from getLogs.
@@ -45,10 +50,11 @@ Anonymous callers stay blocked from getLogs.
    keys at a 50k-unit/hour budget, *if load is spread evenly*. Bursts, geth nodes in
    the pool, and uncapped query shapes all lower this.
 8. **Reth itself held up under bounded getLogs, so the past outages were likely made
-   worse by the proxy.** The proxy has no in-flight cap and no batch cap. It fully
-   parses and re-serializes large responses on the event loop, and its circuit
-   breaker and fallback retries feed back into each other. This is a hypothesis;
-   incident logs are needed to confirm it (see "Open questions").
+   worse by the software in front of it.** This proxy (the edge) has no in-flight
+   cap and no batch cap. It fully parses and re-serializes large responses on the
+   event loop, and its circuit breaker and fallback retries feed back into each
+   other. Points 9 and 10 cover the downstream services. These are hypotheses from
+   reading code; see "Open questions" for how to confirm them.
 9. **The downstream chain multiplies slow getLogs.** Reading bg-rpc-proxy and
    bg-rpc-pool showed that timeouts don't line up across the layers (pool 10 s plus a
    second-node retry; bg-rpc-proxy 15 s plus a fallback; this proxy 15 s plus a
@@ -71,16 +77,16 @@ Anonymous callers stay blocked from getLogs.
 | Reth `--rpc.max-blocks-per-filter` | **10,000** (backstop; default 100,000) | stops the 6–11 s scans of 100k blocks |
 | Reth `--rpc.max-logs-per-response` | consider **~5,000** (default 20,000) | fails fast either way; 5,000 logs is ~3–3.5 MB instead of ~12.5–14 MB, which the chain handles far better (see "Message size and compression findings"). Applies to every getLogs on the node. |
 | Lower block limit | reject `fromBlock < L` per node; find L by binary search on `eth_getBlockReceipts` (~19 calls) | reth returns silent `[]` below L |
-| Global getLogs concurrency per reth node | **8** | throughput levels off at 8 |
+| getLogs concurrency per reth node | **~4** (enforced by the pool) | the tested node's throughput levels off at 8; ~4 leaves headroom for weaker volunteer hardware and older reth versions |
 | Per-key concurrency | **2** | |
 | Metering unit | ~1 unit per 100 blocks in the range (10k blocks = 100 units, the current `eth_getLogs` weight), minimum ~5 | cost follows range; range is known before forwarding |
 | Proxy response size cap | **~16 MB** at 20k logs, or **~5 MB** with a 5,000-log cap | largest observed 12.5 MB at the 20k-log cap |
 | Pool Socket.IO `maxHttpBufferSize` | raise from the **1 MB default** to just above the largest allowed response | **required**: larger responses currently disconnect the node |
 | Pool Socket.IO `perMessageDeflate` | **enable** | node clients already offer it; cuts volunteer upload time |
 | getLogs per batch | **≤ ~5**, each charged separately; also cap total batch length for all callers | batches run sequentially; reth accepted 1,000 |
-| Timeout | normal 15 s is fine once the range cap is in place | slowest 10k query ~1.6 s |
+| Edge proxy timeout | normal 15 s is fine once the range cap is in place, as long as the downstream timeouts are shorter (see "Timeouts across layers") | slowest 10k query ~1.6 s |
 | Circuit breaker / fallback | getLogs **excluded** from breaker accounting; **no** fallback retry | avoid pushing everyone onto the fallback |
-| Upstream routing | send keyed getLogs **only to reth nodes** | reth enforces the log and block caps; geth has no result cap and is untested |
+| Upstream routing | send keyed getLogs **only to reth nodes** (done in the pool; see "Pool: routing") | reth enforces the log and block caps; geth has no result cap and is untested |
 | Requests over the cap | **reject at the edge proxy, don't split**; the error states the max range and suggests a `[fromBlock, toBlock]` that fits | see "Handling requests over the cap" |
 | Pool: retry on timeout | **no second-node retry** for getLogs | the aborted query keeps running, so a retry doubles the work |
 | Pool: 3-node comparison | **exclude getLogs** (add it to `methodsToSkipComparison`) | 1 in 20 getLogs currently runs on 3 nodes |
@@ -336,14 +342,19 @@ H: ENS, 100k-block range, ~10.4 s alone. 8 copies were sent at once. Probe P (US
 - `trace_block`: `Method not found`, so trace isn't enabled on reth.
 - `rpc_modules`: `Method not found`, since the `rpc` namespace isn't enabled.
 - **Not tested: whether the node can be reached from the internet** (test 10a). If
-  it can, all proxy-side protections can be bypassed.
+  it can, all proxy-side protections can be bypassed. Lower risk than it first
+  seemed: the pool reaches nodes only over their own outbound Socket.IO session, so
+  this only matters for operators who port-forward 8545 themselves (see "Load
+  balancer (bg-rpc-pool) findings", point 6).
 
 ---
 
-## Proxy-side weaknesses (hypothesis for past outages)
+## Edge proxy weaknesses (this repo)
 
-Reth handled bounded getLogs well, so these proxy behaviors likely made past
-incidents worse. References are to `proxy.js` as of commit `f73eef6`.
+Reth handled bounded getLogs well, so these behaviors in this proxy likely made past
+incidents worse. The downstream findings (bg-rpc-proxy, the pool, and the 1 MB
+message limit) are a stronger explanation; see those sections. References are to
+`proxy.js` as of commit `f73eef6`.
 
 1. **Full buffering and re-serialization.** Axios parses the whole upstream response,
    then `res.send` serializes it again. For ~12 MB getLogs responses, that's
@@ -368,13 +379,14 @@ incidents worse. References are to `proxy.js` as of commit `f73eef6`.
 
 From reading https://github.com/BuidlGuidl/bg-rpc-pool (`config.js`, `pool.js`,
 `utils/handleRequestSingle.js`, `utils/handleRequestSet.js`,
-`utils/selectRandomClients.js`). The chain as described in its README:
-clients → proxy → pool (`POST /requestPool`) → volunteer nodes over Socket.IO.
+`utils/selectRandomClients.js`). The pool receives requests from bg-rpc-proxy on
+`POST /requestPool` and sends them to volunteer nodes over Socket.IO.
 
 1. **The pool likely explains production getLogs taking over 15 s.** `config.js` sets
    `eth_getLogs` to a **10 s** timeout per node (default is 3 s), and
    `handleRequestSingle` **retries a second node after a timeout**. A slow getLogs can
-   take **~20 s** in the pool, beyond this proxy's 15 s timeout. Test 7 showed reth
+   take **~20 s** in the pool, beyond the 15 s timeouts in both bg-rpc-proxy and this
+   proxy. Test 7 showed reth
    doesn't stop work when the caller disconnects, so the first node keeps working
    while the second starts: **one slow query becomes two.**
 2. **1 in 20 getLogs goes to three nodes at once.** getLogs isn't in
@@ -428,9 +440,14 @@ clients → proxy → pool (`POST /requestPool`) → volunteer nodes over Socket
 
 From reading https://github.com/austintgriffith/geth-node-ssl-proxy/tree/bg-rpc-proxy
 (`proxy.js`, `config.js`, `utils/handleRequest.js`, `utils/validateRpcRequest.js`;
-its README is outdated and was ignored). Assumes this repo's `TARGET_URL` points to
-bg-rpc-proxy, making the chain:
-**this proxy → bg-rpc-proxy → bg-rpc-pool → volunteer nodes.**
+its README is outdated and was ignored).
+
+Confirmed: this repo's `TARGET_URL` points to port **48544**, bg-rpc-proxy's public
+port (`proxyPortPublic` in its `config.js`). This machine's `.env` uses the
+`stage.rpc.buidlguidl.com` host; check that production points to the same service.
+This proxy's `FALLBACK_URL` is **Alchemy**. Alchemy has its own getLogs limits, so
+some over-cap queries would also be rejected there, but anything it serves costs
+paid compute units.
 
 1. **Batches are split here, and the items run one after another.** `app.post("/")`
    loops over the batch and `await`s each `processSingleRequest` in turn. A batch of N
@@ -754,53 +771,67 @@ Each step can be released and checked on its own:
 
 ## Open questions and follow-ups
 
-- [ ] **Incident logs:**
-  - Did `CIRCUIT_OPEN` Telegram alerts fire during the getLogs spam?
-  - Did the proxy process crash or run out of memory, or did the nodes fall out of
-    sync?
-  - Which clients served the heavy queries?
-- [ ] **Test 10a:** can each pool node's port 8545 or 8546 be reached from the
-  internet? Lower priority now: pool traffic reaches nodes only over their outbound
-  Socket.IO session, so this only matters for operators who port-forward.
-- [x] **Batch path:** answered. bg-rpc-proxy splits batches and runs the items one
-  after another (see "bg-rpc-proxy findings").
-- [ ] **`ignoredErrorCodes`:** check whether reth's "exceeds max results" and "max
-  block range" error codes are in the shared `ignoredErrorCodes` file. If not,
-  bg-rpc-proxy sends those queries to the paid fallback.
-- [ ] **`TARGET_URL`:** confirm that it points to bg-rpc-proxy.
-- [ ] **Confirm the 1 MB limit in production:**
-  - check the deployed pool's Socket.IO options
+### To confirm (verify the code-reading findings in production)
+
+- [ ] **The 1 MB limit, the most important check:**
+  - check the deployed pool's Socket.IO options for `maxHttpBufferSize`
   - look in the pool logs for `eth_getLogs` `timeout_error` entries followed by
-    node reconnects
-  - look for a disconnect in a buidlguidl-client debug log after a large response
+    reconnects from the same node
+  - look for a disconnect in a buidlguidl-client debug log right after a large
+    response
+- [ ] **`ignoredErrorCodes`:** check whether reth's "exceeds max results" and "max
+  block range" error codes are in the shared `ignoredErrorCodes` file (on the
+  bg-rpc-proxy / pool host; not on this machine). If not, bg-rpc-proxy sends those
+  queries to the paid fallback.
+- [ ] **Production `TARGET_URL`:** this machine's `.env` points to
+  `stage.rpc.buidlguidl.com:48544`. Confirm that production points to bg-rpc-proxy
+  the same way.
+- [ ] **Incident logs, if any turn up:** did `CIRCUIT_OPEN` Telegram alerts fire
+  during the getLogs spam, and did any process crash or run out of memory?
+
+### To measure
+
 - [ ] **Other methods over 1 MB:** measure `eth_getBlockReceipts` and full
   `eth_getBlockByNumber` sizes on busy blocks. If they exceed 1 MB, they're affected
-  today too.
+  by the Socket.IO limit today too.
 - [ ] **Compression ratio:** gzip one saved large getLogs response to measure what
   `perMessageDeflate` would save.
-- [ ] **Log cap:** decide between keeping 20,000 logs per response or dropping to
-  ~5,000.
-- [ ] **Receipt limit (L) at check-in:** add L to buidlguidl-client's pool check-in.
-  Client type is already reported (`execution_client`). With both, the pool can route
-  keyed getLogs to reth nodes whose L covers the range.
-- [ ] **Older reth versions:** check the defaults for `--rpc.max-logs-per-response`
-  and `--rpc.max-blocks-per-filter` on v1.9–v2.3, or set them explicitly in
-  buidlguidl-client.
+- [ ] **Receipt `null` bug on other clients:** compare `eth_getTransactionReceipt` for
+  transactions older than L on geth and Nethermind. Decide whether to route
+  old-receipt requests away from reth.
+- [ ] **Older reth versions:** check the default log and block caps on v1.9–v2.3.
+  Moot if the flags are set explicitly in buidlguidl-client (next section).
 - [ ] **Error message format:** confirm which "range too large" message formats viem,
   ethers and ponder parse for automatic splitting.
-- [ ] **Receipt `null` bug:** compare `eth_getTransactionReceipt` for transactions
-  older than L on geth and Nethermind. Decide whether to route old-receipt requests
-  away from reth.
-- [ ] **L on the other reth nodes:** each may differ; the proxy needs L per node, or
-  a single conservative value.
-- [ ] **Straddling range (5a):** rerun with a sparse address to confirm that partial
-  results come back silently.
-- [ ] **Load balancer:** answered. `TARGET_URL` leads to bg-rpc-pool, and nodes can't
-  be reached directly, so reth-only routing has to happen in the pool (see "Load
-  balancer (bg-rpc-pool) findings").
-- [ ] **buidlguidl-client change:** set `--rpc.max-blocks-per-filter` for all client
-  users, or only for pool nodes?
+- [ ] **Test 10a (low priority):** can any pool node's port 8545 or 8546 be reached
+  from the internet? Only matters for operators who port-forward.
+
+### To decide
+
+- [ ] **Log cap:** keep 20,000 logs per response, or drop to ~5,000.
+- [ ] **buidlguidl-client flags:** set `--rpc.max-blocks-per-filter` and
+  `--rpc.max-logs-per-response` explicitly for all client users, or only for pool
+  nodes?
+- [ ] **Receipt limit (L):** add L to buidlguidl-client's pool check-in (client type
+  is already reported), so the pool can route keyed getLogs to reth nodes whose L
+  covers the range. Or, more simply, only allow a recent window that every node is
+  sure to have.
 - [ ] **Key store:** Postgres was recommended, for keys and metering together.
   rpc-token-manager, mentioned in the retracted PR, is unaccounted for.
 - [ ] **Key issuance:** who can get a key, and what it costs them. This is the real
   security boundary.
+
+### Answered
+
+- [x] **Batch path:** bg-rpc-proxy splits batches and runs the items one after
+  another (see "bg-rpc-proxy findings").
+- [x] **Load balancer / `TARGET_URL`:** `TARGET_URL` points to bg-rpc-proxy
+  (port 48544), which forwards to bg-rpc-pool. Nodes can't be reached directly, so
+  reth-only routing has to happen in the pool.
+- [x] **Client type at check-in:** already reported (`execution_client`); the pool
+  just doesn't use it for routing yet.
+- [x] **Straddling range (5a):** no rerun needed. 5b showed reth returns silent `[]`
+  below L, so the proxy has to enforce `fromBlock ≥ L` regardless of partial-range
+  behavior.
+- [x] **L on other reth nodes:** each node's L depends on its snapshot, so it will
+  differ. Handled by the L decision above.
