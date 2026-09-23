@@ -5,7 +5,9 @@ or load balancer), from a separate machine on the same LAN. No host metrics were
 available; everything was measured over RPC. Code review of the downstream services
 (bg-rpc-proxy, bg-rpc-pool, buidlguidl-client) done 2026-09-23 by reading their code,
 not by testing. A second round of tests on the same node (tests 11–13: response sizes
-of block-level methods, compression ratios, error codes) ran 2026-09-23.
+of block-level methods, compression ratios, error codes) ran 2026-09-23. A third round
+(tests 14–19: cost of heavier non-getLogs methods) also ran 2026-09-23; see "Future
+work: heavy non-getLogs methods".
 
 Request chain: **this proxy (edge) → bg-rpc-proxy → bg-rpc-pool → volunteer nodes**
 (over Socket.IO).
@@ -1078,3 +1080,91 @@ Knock-on effects:
 - [x] **`ignoredErrorCodes`:** `-32602` is in the shared file, so reth's cap
   rejections go back to the caller and are never sent to the fallback. Timeouts
   still are (bg-rpc-proxy finding 3).
+
+---
+
+## Future work: heavy non-getLogs methods
+
+The edge proxy blocks a set of namespaces (`admin_`, `personal_`, `debug_`, `miner_`,
+`engine_`, `clique_`, `les_`) and weights almost every remaining method as **1 unit**,
+the same as `eth_blockNumber`. Tests 14–19 (2026-09-23, same reth node, direct) measured
+the per-request cost of the heavier `eth_` methods to inform per-method weights and
+limits. This is separate from the getLogs work above and not yet part of any design.
+
+**Important caveat: three methods are understated.** Tests 14, 15 and 19 scaled the
+*number* of operations (many trivial `balanceOf` calls) but not the *cost per
+operation*. `eth_call`, `eth_estimateGas` and `eth_simulateV1` can each run up to
+reth's 50M gas cap per call (`--rpc.gascap`), which these tests never triggered. Their
+measured cost is a **floor, not a ceiling.** A follow-up should hold the operation
+count at 1 and raise the gas per call (with and without state overrides).
+
+### Confirmed findings
+
+1. **Filter methods are an `eth_getLogs` bypass.** `eth_getFilterLogs` returned the
+   identical result to the equivalent `eth_getLogs` (16,165 logs, 10.27 MB, 153 vs
+   155 ms, test 18b), and reth applies the same caps (a 150k-block filter was rejected
+   with `-32602` "query exceeds max block range 100000", test 18d). But the edge proxy
+   blocks the method *name* `eth_getLogs`, so `eth_newFilter` + `eth_getFilterLogs`
+   runs the same query under names that aren't blocked. 20 filters were created with no
+   per-connection limit (18e). **Whatever getLogs policy is chosen must cover
+   `eth_newFilter`, `eth_getFilterLogs` and `eth_getFilterChanges` identically.**
+   (Through the pool these calls hit random nodes, so a filter made on one node is
+   usually absent on the next; this test used one direct connection to measure node
+   behavior.)
+
+2. **`eth_getProof` has no cap on storage keys, and the response grows unbounded.**
+   1,000 keys → 6.27 MB and ~600 ms, ~100× baseline (~6,270 bytes per key, test 16).
+   It **crosses the 1 MB Socket.IO limit at ~167 keys**, so a single request with a
+   couple hundred keys both disconnects the node and does real work. Needs a cap on the
+   number of storage keys (e.g. 100).
+
+3. **`eth_feeHistory(1024)` was the slowest single request measured: 1,635 ms**, ~272×
+   baseline, from a ~100 KB response (test 17). Cheap to send, deterministic, pure node
+   CPU. The jump from 100 blocks (6 ms) to 1,024 (1,635 ms) is very non-linear, so it
+   is **worth re-running to rule out a cold-cache fluke.** reth already caps blockCount
+   at 1,024; this method should also be weighted well above 1.
+
+### Measured worst case per method
+
+Worst = slowest single request for that method in tests 14–19, including deliberately
+extreme parameters, on an otherwise idle node. Baseline = `eth_call` p50 of 6 ms
+(test 14a). Concurrency was not measured.
+
+| method | worst step | worst ms | bytes | × baseline | note |
+|---|---|---|---|---|---|
+| `eth_feeHistory` | blockCount 1024 | 1635 | 99,582 | 272× | cheap to trigger; re-check |
+| `eth_getProof` | 1000 keys | 599 | 6,268,677 | 100× | also a >1 MB response |
+| `eth_getLogs` | 150-block range | 155 | 10,267,242 | 26× | covered by getLogs design |
+| `eth_getFilterLogs` | same range | 153 | 10,267,242 | 25× | = getLogs (finding 1) |
+| `eth_call` | 500 sub-calls | 31 | 9,830 | 5× | **understated** (trivial ops) |
+| `eth_simulateV1` | 256 blocks | 27 | 506,243 | 4.5× | **understated** (trivial ops) |
+| `eth_newFilter` | one call | 20 | 70 | 3× | starts a log query (finding 1) |
+| `eth_estimateGas` | one call | 11 | 42 | 1.8× | **understated** (trivial op) |
+
+### Other measured details
+
+- **`eth_call` historical state (14c):** a call at HEAD − 5,000 succeeded; at
+  HEAD − 50,000 it failed with `state at block #… is pruned`. This matches the
+  `account_history distance = 10064` prune setting: historical-state calls work back
+  only ~10k blocks (~1.4 days), a much shorter window than logs (L, ~100 days).
+- **`eth_simulateV1` is supported** on this reth version (v2.5.0).
+
+### Response sizes crossing the 1 MB Socket.IO limit
+
+Adds to the getLogs and `eth_getBlockReceipts` cases in "Message size and compression
+findings":
+- `eth_getProof` with ≳167 storage keys (measured 6.27 MB at 1,000 keys)
+- `eth_getFilterLogs` (10.27 MB, same as getLogs)
+
+### Suggested next steps
+
+- [ ] Handle `eth_newFilter` / `eth_getFilterLogs` / `eth_getFilterChanges` under the
+  same policy as `eth_getLogs` at the edge proxy.
+- [ ] Cap `eth_getProof` storage keys (~100).
+- [ ] Weight `eth_feeHistory`, `eth_getProof`, and the execution methods
+  (`eth_call`, `eth_estimateGas`, `eth_simulateV1`) above 1 in the edge proxy.
+- [ ] Measure the real worst case of `eth_call` / `eth_estimateGas` / `eth_simulateV1`
+  by raising gas per call (bounded), not operation count.
+- [ ] Re-run `eth_feeHistory(1024)` to confirm the 1.6 s cost.
+- [ ] Check which namespaces the geth and Nethermind nodes expose (`trace_*`,
+  `txpool_*`); not tested here (reth exposes neither).
