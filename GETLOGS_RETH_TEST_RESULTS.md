@@ -903,6 +903,110 @@ Each step can be released and checked on its own:
 
 ---
 
+## Design target: Alchemy Pay As You Go
+
+**Requested target (2026-09-23):** keyed getLogs should behave "the same as Alchemy"
+for an entry-level paid account, i.e. Alchemy's **Pay As You Go** plan (not Free).
+
+This section compares that target with what the chain can support. **It doesn't
+replace the recommended settings above,** which come from our own tests. It lists
+where the target and those settings differ, and the decisions needed to reconcile
+them.
+
+### Alchemy Pay As You Go limits (Ethereum)
+
+From Alchemy's documentation, retrieved 2026-09-23. Alchemy updates its limits
+periodically, so re-check before building against them.
+
+| Limit | Pay As You Go | (Free, for comparison) |
+|---|---|---|
+| Block range | **unlimited**, subject to the safety nets below | 10 blocks |
+| Safety nets | **any range with ≤ 10,000 logs** in the response, **or** a range of **≤ 2,000 blocks** with no log cap | — |
+| Response size | 150 MB | 150 MB |
+| History | back to genesis (archive) | back to genesis |
+| Cost | flat **60 compute units** per call, whatever the range | 60 CU |
+
+Alchemy's error when a request exceeds the safety nets uses code **`-32602`**, the
+same code as reth:
+
+> "Log response size exceeded. You can make eth_getLogs requests with up to a 2K
+> block range and no limit on the response size, or you can request any block range
+> with a cap of 10K logs in the response."
+
+Unlike reth and Infura, Alchemy's message doesn't suggest a specific range that
+would work.
+
+Sources:
+- [eth_getLogs | Alchemy Docs](https://www.alchemy.com/docs/reference/eth-getlogs)
+- [eth_getLogs - Ethereum API | Alchemy Docs](https://www.alchemy.com/docs/chains/ethereum/ethereum-api-endpoints/eth-get-logs)
+- [Understanding Logs: Deep Dive into eth_getLogs | Alchemy Docs](https://www.alchemy.com/docs/deep-dive-into-eth_getlogs)
+- [ethers.js issue #4703](https://github.com/ethers-io/ethers.js/issues/4703) (Alchemy and Infura error formats)
+
+### How close we can get
+
+| Rule | Alchemy Pay As You Go | Achievable here | Why it differs |
+|---|---|---|---|
+| ≤ 2,000 blocks | any number of logs, up to 150 MB | allowed, but logs capped (10k or 20k) | the chain can't carry 150 MB responses: the 1 MB Socket.IO limit, memory and JSON parsing in three Node processes, volunteer upload links |
+| > 2,000 blocks | any range, if ≤ 10k logs | allowed **up to a maximum range**, if ≤ 10k logs | **reth has no log index**: it scans every block in the range (~0.5–1 s per 10k blocks, detailed finding 3). Alchemy's backend can answer sparse wide-range queries quickly; a reth node can't. |
+| History | back to genesis | back to L only (~100 days on the tested node) | pool nodes are pruned full nodes synced from snapshots (detailed finding 1) |
+| Error format | `-32602` + message | same code, Alchemy's wording | none; matching it helps clients built against Alchemy |
+
+### The three gaps
+
+**1. A maximum block range is unavoidable.** "Any range" on a reth node means
+scanning everything available: ~735k blocks on the tested node, **~40–75 s of node
+work for one request**, and aborting it doesn't stop the work (detailed finding 9).
+Options:
+
+| Maximum range | Worst case per request | What it requires |
+|---|---|---|
+| **10k blocks** (current recommendation) | ~1.6 s | fits all current recommendations as they stand |
+| **100k blocks** (reth default) | 6–11 s | a pool getLogs timeout above ~12 s, a strict per-node concurrency cap, and no fallback after timeouts (these queries are the ones most likely to time out) |
+
+**2. History is ~100 days, not full history.** Options:
+- reject `fromBlock < L` with a clear message (current recommendation), or
+- **send ranges below L to Alchemy.** It's already paid for, and users would get full
+  history, as they would on Alchemy. This deliberately uses the fallback for
+  getLogs, so it would need its own cap and metering.
+
+**3. Dense queries over short ranges are capped.** With
+`--rpc.max-logs-per-response 10000`, a dense contract like USDC hits the cap at ~70
+blocks, where Alchemy would still serve it (up to 150 MB). Raising the cap brings us
+closer to Alchemy but costs more memory and parsing in the chain. This is the same
+log-cap decision as in "Open questions → To decide."
+
+### Mapping the target onto the settings
+
+| Target rule | Setting | Matches Alchemy? |
+|---|---|---|
+| ≤ 10k logs for ranges over 2k blocks | reth `--rpc.max-logs-per-response 10000` | **exactly** |
+| no log cap for ranges of ≤ 2k blocks | same flag (reth has one cap for all ranges) | stricter |
+| unlimited range | reth `--rpc.max-blocks-per-filter` + the edge proxy's range cap | stricter (gap 1) |
+| full history | reject below L, or send to Alchemy | stricter, unless sent to Alchemy (gap 2) |
+| `-32602` + Alchemy's message | edge proxy error format; add a suggested range, since reth already calculates one | yes |
+
+Knock-on effects:
+- **Metering:** Alchemy charges a flat 60 CU per call. Our costs grow with the range,
+  so a flat charge only fits a small maximum range. With a 10k-block maximum, a flat
+  charge is reasonable (worst case ~1.6 s). At 100k, charge by range.
+- **Batches:** Alchemy's getLogs page doesn't document a per-batch limit. Ours still
+  has to stay: batches run one item at a time in both reth and bg-rpc-proxy.
+- **The log cap moves toward 10,000.** The target sets it: 10k matches Alchemy's
+  rule for ranges over 2k blocks exactly. That's between the default (20k) and the
+  ~5k considered for the chain's sake.
+
+### Decisions needed
+
+- [ ] **Maximum block range:** 10k (fits the tested recommendations) or 100k (closer
+  to Alchemy, needs longer timeouts and stricter concurrency limits)?
+- [ ] **History below L:** reject, or serve from Alchemy with a cap and metering?
+- [ ] **Log cap:** 10,000 (matches Alchemy for ranges over 2k blocks), or higher for
+  short ranges at the cost of memory and parsing in the chain?
+- [ ] **Metering:** flat per call (like Alchemy; only reasonable with a 10k-block
+  maximum) or by range?
+
+---
+
 ## Open questions and follow-ups
 
 ### To confirm (verify the code-reading findings in production)
