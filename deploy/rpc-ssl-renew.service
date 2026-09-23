@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew Let's Encrypt certificate for rpc-ssl-proxy
+Documentation=file:/home/ubuntu/rpc-ssl-proxy/le.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/ubuntu/rpc-ssl-proxy/le.sh
+# certbot --standalone binds :80 for the ACME http-01 challenge, so nothing else
+# may hold that port while this runs. The proxy itself only listens on :443.

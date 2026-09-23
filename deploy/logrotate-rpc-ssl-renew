@@ -1,0 +1,14 @@
+# Install to /etc/logrotate.d/rpc-ssl-renew
+# le.sh appends every renewal check here, so it grows unattended.
+/var/log/rpc-ssl-renew.log {
+    # /var/log is root:syslog and group-writable, which logrotate refuses to
+    # touch without being told explicitly whose privileges to rotate under.
+    su root syslog
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
