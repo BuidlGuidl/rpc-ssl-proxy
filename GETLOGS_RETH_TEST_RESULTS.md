@@ -96,7 +96,7 @@ Anonymous callers stay blocked from getLogs.
 | Proxy block-range cap (keyed getLogs) | **10,000 blocks** | worst observed ~1.6 s cold |
 | Reth `--rpc.max-blocks-per-filter` | **10,000** (backstop; default 100,000) | stops the 6–11 s scans of 100k blocks |
 | Reth `--rpc.max-logs-per-response` | consider **~5,000** (default 20,000) | fails fast either way; 5,000 logs is ~3–3.5 MB instead of ~12.5–14 MB. With compression the upload cost is small either way, so the remaining reason is memory and JSON parsing in the Node processes (see "Message size and compression findings"). Applies to every getLogs on the node. |
-| Lower block limit | reject `fromBlock < L` per node; find L by binary search on `eth_getBlockReceipts` (~19 calls) | reth returns silent `[]` below L |
+| Lower block limit | reject `fromBlock < L` per node. L is read from reth's static-file receipt header on the node and reported at check-in as `receipt_floor` (implemented in buidlguidl-client 2026-09-24; see detailed finding 1) | reth returns silent `[]` below L |
 | getLogs concurrency per reth node | **~4** (enforced by the pool) | the tested node's throughput levels off at 8; ~4 leaves headroom for weaker volunteer hardware and older reth versions |
 | Per-key concurrency | **2** | |
 | Metering unit | ~1 unit per 100 blocks in the range (10k blocks = 100 units, the current `eth_getLogs` weight), minimum ~5 | cost follows range; range is known before forwarding |
@@ -194,6 +194,16 @@ not stop that work.
   outside our control.
 - **L is fixed; it does not move with the head.** Each node's L depends on when and
   from what snapshot it was bootstrapped, so it will differ between nodes.
+- **L can be read locally without RPC** (implemented in buidlguidl-client,
+  2026-09-24, `ethereum_client_scripts/rethReceiptFloor.js`): the lowest
+  `static_file_receipts_*.conf` in reth's datadir has an 87-byte bincode
+  little-endian header whose `block_range.start` is the floor. ~3 ms, no reth
+  subprocess. Verified on a live reth v2.5.0 node: **25,300,000**, matching the RPC
+  binary search above. Returns `null` on an unknown layout. Two reth-internal
+  sources were checked and are **wrong** for this: the `PruneCheckpoints` table
+  reports 25,345,503 (~45k blocks too high), and `reth.toml`
+  `prune.receipts.before` (15,537,394) is config, not what the snapshot contained.
+  The node reports the value at pool check-in as `receipt_floor` (reth nodes only).
 
 ### 2. Range scaling on a busy contract: USDC (test 1)
 
@@ -525,21 +535,24 @@ From reading https://github.com/BuidlGuidl/bg-rpc-pool (`config.js`, `pool.js`,
    - **2 geth** (v1.16.7, v1.17.4)
    - **1 Nethermind** (v8.1.2)
 
-   Only reth 2.5.0 was tested. Defaults for the log and block caps may differ in older
-   versions, so set those flags explicitly in buidlguidl-client rather than relying
-   on version defaults.
+   Only reth 2.5.0 was tested; users will not run reth older than 2.5.0. The log and
+   block caps are now set explicitly in buidlguidl-client
+   (`ethereum_client_scripts/reth.js`, 2026-09-24: `--rpc.max-blocks-per-filter
+   10000`, `--rpc.max-logs-per-response 10000`).
 
    Some nodes were unhealthy at the time of the snapshot: one reth 1.11.3 node at 98%
    CPU and ~27k blocks behind; the Nethermind node at 99.7% CPU and ~12k behind; one
    node at 98% storage. The head-block filter already keeps the lagging ones out of
    routing. Two nodes showed Socket ID `N/A`, which may be normal reconnecting or the
    1 MB disconnect; unverified.
-5. **The pool doesn't know each node's receipt limit (L).** It picks nodes by head
-   block and past timeout rate only. Each volunteer node has its own L, set by the
-   snapshot it synced from. Options:
-   - nodes report L at check-in, and the pool only sends a getLogs to nodes whose L is
-     at or below its `fromBlock`; or
-   - keyed getLogs only allows a recent window that every node is sure to have.
+5. **The pool doesn't use each node's receipt limit (L) yet.** It picks nodes by
+   head block and past timeout rate only. Each volunteer node has its own L, set by
+   the snapshot it synced from. As of 2026-09-24 the client **reports it** at check-in
+   as `receipt_floor` (reth nodes only; `null` if the datadir layout isn't
+   recognized). The pool side is still to do: expose it in
+   `utils/getPoolNodesObject.js` and route getLogs only to reth nodes whose
+   `receipt_floor` is non-null and at or below `fromBlock` (see the implementation
+   plan, Phase 3).
 6. **Exposure is lower than feared.** Pool nodes never receive internet traffic
    through the pool; they only get work over their own outbound Socket.IO session. Test
    10a matters only for operators who port-forward 8545 themselves.
@@ -1031,8 +1044,6 @@ Knock-on effects:
 - [ ] **Receipt `null` bug on other clients:** compare `eth_getTransactionReceipt` for
   transactions older than L on geth and Nethermind. Decide whether to route
   old-receipt requests away from reth.
-- [ ] **Older reth versions:** check the default log and block caps on v1.9–v2.3.
-  Moot if the flags are set explicitly in buidlguidl-client (next section).
 - [ ] **Error message format:** confirm which "range too large" message formats viem,
   ethers and ponder parse for automatic splitting.
 - [ ] **Test 10a (low priority):** can any pool node's port 8545 or 8546 be reached
@@ -1043,13 +1054,6 @@ Knock-on effects:
 - [ ] **Log cap:** keep 20,000 logs per response, or drop to ~5,000. With compression
   the upload cost is small either way; the deciding factor is memory and JSON
   parsing in the Node processes.
-- [ ] **buidlguidl-client flags:** set `--rpc.max-blocks-per-filter` and
-  `--rpc.max-logs-per-response` explicitly for all client users, or only for pool
-  nodes?
-- [ ] **Receipt limit (L):** add L to buidlguidl-client's pool check-in (client type
-  is already reported), so the pool can route keyed getLogs to reth nodes whose L
-  covers the range. Or, more simply, only allow a recent window that every node is
-  sure to have.
 - [ ] **Key store:** Postgres was recommended, for keys and metering together.
   rpc-token-manager, mentioned in the retracted PR, is unaccounted for.
 - [ ] **Key issuance:** who can get a key, and what it costs them. This is the real
@@ -1078,6 +1082,15 @@ Knock-on effects:
 - [x] **`ignoredErrorCodes`:** `-32602` is in the shared file, so reth's cap
   rejections go back to the caller and are never sent to the fallback. Timeouts
   still are (bg-rpc-proxy finding 3).
+- [x] **buidlguidl-client flags:** set for **all** client users, 2026-09-24
+  (`ethereum_client_scripts/reth.js`). Users won't run reth older than 2.5.0, so
+  version-specific defaults don't matter.
+- [x] **Receipt limit (L) at check-in:** implemented 2026-09-24. The client reads it
+  from reth's static-file receipt header and reports `receipt_floor` (reth only,
+  `null` on unrecognized layouts). Pool routing on it is Phase 3 of the plan.
+- [x] **Node-side response cap:** `maxContentLength: 32e6` on the client's call to
+  reth, returning `-32603` over the cap (2026-09-24). No node-side timeouts, by
+  design: timeout policy lives only in the pool.
 
 ---
 

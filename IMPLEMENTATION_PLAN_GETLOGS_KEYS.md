@@ -1,6 +1,8 @@
 # Implementation Plan: Keyed `eth_getLogs` Access
 
-Status: **proposed, nothing implemented.** Written 2026-09-23.
+Status: **in progress.** Written 2026-09-23. Updated 2026-09-24: the
+buidlguidl-client side (Phases 1b, 2a, 2b) is implemented, with deliberate departures
+from the original plan noted in those sections. Everything else is still proposed.
 
 Goal: re-enable `eth_getLogs` for callers holding an API key, with metering and hard
 limits, without repeating the outage that led to the block. Anonymous callers stay
@@ -45,8 +47,8 @@ For getLogs only. Other methods keep current values; aligning them is a separate
 | Layer | Now | Target | Rule |
 |---|---|---|---|
 | reth (node) | none | none | node caps bound the work instead |
-| buidlguidl-client → reth (axios) | none | **4 s**, `maxContentLength` 32 MB | returns an error instead of hanging or disconnecting; must be shorter than the pool's timeout so the pool sees an error, not a timeout |
-| Pool per-node | 10 s + retry on 2nd node | **5 s, no retry** | slowest 10k query ~1.6 s |
+| buidlguidl-client → reth (axios) | none | **none (by design)**; `maxContentLength` 32 MB only | timeout policy lives in the pool only. A node-side timeout wouldn't stop reth's work (test 7), the 10k cap already bounds a query to ~1.6 s, and per-method timeouts on the client would duplicate the pool's config and drift. Size is capped here because that must be an error, not a disconnect. |
+| Pool per-node | 10 s + retry on 2nd node | **5 s, no retry** | slowest 10k query ~1.6 s. **This is the only timeout on the node path**; the pool must not assume a node-side timeout exists. A slow getLogs surfaces here as the pool's own timeout, never as a `-32603` from the node. |
 | bg-rpc-proxy → pool | 15 s (+10 s fallback) | **8 s, no fallback** | > pool total |
 | Edge → bg-rpc-proxy | 15 s (+ fallback, + breaker) | **12 s, no fallback, not counted by the breaker** | > bg-rpc-proxy total |
 
@@ -117,24 +119,30 @@ receipts.
 
 Rollback: revert the two options.
 
-### 1b. buidlguidl-client: bound the node-side RPC call
+### 1b. buidlguidl-client: bound the node-side response size — **implemented 2026-09-24**
 
-File: `webSocketConnection.js` (~line 174, the `axios.post("http://localhost:8545")`
-in the `rpc_request` handler).
+File: `webSocketConnection.js` (the `axios.post("http://localhost:8545")` in the
+`rpc_request` handler).
 
-- Add `timeout` (per method: **4 s** for getLogs / filter methods, **2.5 s**
-  otherwise; each below the pool's timeout for that method) and
-  `maxContentLength: 32e6`. This is the cap that carries the size policy for node
-  responses: it's half the pool's 64 MB Socket.IO limit, so an oversized response
-  always becomes a JSON-RPC error here, never a disconnect there. Today the call has
-  neither option, so a slow or oversized response is only ever cut off by the pool's
-  timeout or the Socket.IO size limit.
-- On either limit, reply with a JSON-RPC error (code `-32603`, message naming the
-  limit) instead of hanging. The pool then gets an error, not a timeout, so the
-  node's timeout rating isn't hurt.
+What shipped:
+- `maxContentLength: 32e6` on the axios call. This is the cap that carries the size
+  policy for node responses: half the pool's 64 MB Socket.IO limit, so an oversized
+  response always becomes a JSON-RPC error here, never a disconnect there.
+- Over the cap → `-32603 "Response exceeds node limit of 32000000 bytes"`. Other
+  failures keep returning `-70000 "Internal node error"`.
 
-Done when: an oversized or slow request against a client build returns the error
-within the timeout.
+Departure from the original plan: **no node-side timeouts.** The per-method axios
+timeouts (4 s / 2.5 s) were dropped because:
+- aborting doesn't stop reth's work (test 7), so a client timeout frees nothing
+- the 10k range cap already bounds a query to ~1.6 s
+- heavy-method timeouts are kept out of node ratings by the `timeout_error_heavy`
+  status (Phase 3 item 8), so there is no rating to protect
+- per-method timeouts on the client would duplicate the pool's config and drift out
+  of sync
+
+Timeout policy therefore lives **only in the pool**. Consequence for Phase 3: a slow
+getLogs shows up at the pool as the pool's own timeout, not as a `-32603` from the
+node; the pool's handling must not depend on a node-side timeout.
 
 ### 1c. bg-rpc-proxy: batch cap and method-aware fallback
 
@@ -234,40 +242,64 @@ negotiated with nodes.
 
 ---
 
-## Phase 2: Node flags and check-in fields (buidlguidl-client release)
+## Phase 2: Node flags and check-in fields (buidlguidl-client) — **client side implemented 2026-09-24**
 
-Files: `ethereum_clients/reth.js` (the launcher args array), `webSocketConnection.js`
-(check-in payload, ~lines 285–310).
+Files: `ethereum_client_scripts/reth.js` (the launcher args array; the original plan
+named `ethereum_clients/reth.js`, which is the wrong path),
+`ethereum_client_scripts/rethReceiptFloor.js` (new), `webSocketConnection.js`
+(check-in payload).
 
-### 2a. Reth flags
+### 2a. Reth flags — implemented
 
-Add to the reth args:
+Added to the reth args in `ethereum_client_scripts/reth.js`:
 - `--rpc.max-blocks-per-filter 10000` (D1 backstop; default 100,000)
 - `--rpc.max-logs-per-response 10000` (D2; default 20,000)
 
 These apply to every getLogs on the node, including direct local use by the
 operator. Both are backstops; the edge enforces the same limits first.
 
-### 2b. Check-in additions
+### 2b. Check-in addition: `receipt_floor` — implemented
 
-Add to the `checkin` payload:
-- `receipt_floor`: the node's L. Compute once at startup by the 19-call binary search
-  on `eth_getBlockReceipts` used in test 0 (bounds: head − 1,200,000 … head), then
-  once a day. Report `null` until known.
-- `getlogs_ready: true` when this client version applied the flags in 2a. The pool
-  routes getLogs only to nodes that report it, so an unupgraded node never receives
-  getLogs. This avoids version-sniffing `execution_client`.
+The `checkin` payload gains one field, `receipt_floor`, sent **only on reth nodes**.
 
-Pool side of the same change: the check-in handler (`pool.js` ~line 634) already
-stores every check-in field via `{ ...existingClient, ...params }`, so no change is
-needed to persist them. But `utils/getPoolNodesObject.js` **whitelists** the fields
-it exposes on `/poolNodes`; add `receipt_floor` and `getlogs_ready` there.
+How it's found (departure from the plan): the plan proposed a 19-call binary search
+on `eth_getBlockReceipts` at startup and daily. Instead,
+`ethereum_client_scripts/rethReceiptFloor.js` **reads the lowest
+`static_file_receipts_*.conf` header in reth's datadir**: an 87-byte bincode
+little-endian header whose `block_range.start` is the floor. No RPC calls, no reth
+subprocess, ~3 ms. It checks that the header's range matches the filename and
+returns `null` on an unknown layout or any error. Verified on a live reth v2.5.0
+node: **25,300,000**, matching the floor found by RPC probing in test 0.
 
-Done when: the pool's `/poolNodes` shows `receipt_floor` and `getlogs_ready` for
-upgraded nodes.
+Not recomputed daily: the floor never moves (it's the snapshot boundary). The value
+is cached in memory once non-null; while still null, the read is retried on later
+check-ins.
 
-Rollout: ship as a client release; nodes pick it up as operators update. Phase 3
-routing tolerates a mix.
+Two reth-internal sources were checked and are **wrong** for this purpose, so don't
+use them: the `PruneCheckpoints` table reports 25,345,503 (~45k blocks too high), and
+`reth.toml` `prune.receipts.before` (15,537,394) reflects config, not what the
+snapshot actually contained.
+
+`receipt_floor` can be `null` on non-static-file datadir layouts (untested; possibly
+older reth datadirs). **The pool treats `null` as not eligible for getLogs.**
+
+**No `getlogs_ready` field** (departure from the plan). The pool routes on the
+existing `execution_client` (`startsWith("reth")`) plus a non-null `receipt_floor`.
+Nodes that haven't picked up the 2a flags are still safe to route to: the edge caps
+the range at 10k blocks, and reth's default 20k-log cap (~12.5 MB) is under the
+pool's 64 MB Socket.IO limit and the node's 32 MB `maxContentLength`.
+
+Pool side of this change (still to do, Phase 3): the check-in handler (`pool.js`
+~line 634) already stores every check-in field via `{ ...existingClient, ...params }`,
+so nothing is needed to persist it. But `utils/getPoolNodesObject.js` **whitelists**
+the fields it exposes on `/poolNodes`; add `receipt_floor` there (only that field).
+
+Done when: the pool's `/poolNodes` shows `receipt_floor` for reth nodes running the
+new client.
+
+Rollout: ships as a client release; nodes pick it up as operators update. Phase 3
+routing tolerates a mix (nodes without the field have `receipt_floor` undefined →
+treated as null → not eligible).
 
 ---
 
@@ -294,13 +326,17 @@ Changes:
    *before* the head-block step, so a reth-only set can't come up empty because a
    geth node is one block ahead):
    - `execution_client` starts with `reth`
-   - `getlogs_ready === true`
-   - `receipt_floor` is known and `≤ fromBlock` (resolve `latest`/`safe`/
-     `finalized`/`earliest` first; `pending` is rejected)
+   - `receipt_floor` is a number (not `null`/undefined) and `≤ fromBlock` (resolve
+     `latest`/`safe`/`finalized`/`earliest` first; `pending` is rejected). A missing
+     or null floor means the node hasn't reported one (old client, or a datadir
+     layout the reader doesn't understand) and it is **not eligible**.
    - in-flight heavy count for the node `< maxPerNode`
 2. **No second-node retry, no 3-node comparison** for heavy methods
    (`handleRequestSingle` retries only when `retry` is true; heavy methods never take
-   the `handleRequestSet` path).
+   the `handleRequestSet` path). **The pool's 5 s timer is the only timeout on the
+   node path.** The client sends no timeout of its own (Phase 1b), so a slow getLogs
+   arrives here as `timeout_error_heavy`, never as a node error; don't wait for or
+   special-case a `-32603` from the node.
 3. **Per-node in-flight counter**, keyed by node `id` (not socket id, which changes
    on reconnect). Increment on send. **Decrement on response or disconnect, not on
    timeout**: the node keeps working after a timeout (test 7), and the pool already
@@ -311,11 +347,11 @@ Changes:
    already in it (`config.js` ~lines 54–56); `eth_getLogs` is not, which is why 1 in
    20 getLogs runs on three nodes today.
 6. **Log line:** one line per heavy request decision with candidate counts after each
-   filter (`16 → 13 reth → 11 ready → 9 covers range → 7 with capacity → picked X`).
+   filter (`16 → 13 reth → 11 floor known → 9 covers range → 7 with capacity → picked X`).
 7. **`GET /getlogsStatus`** on the pool's internal API (port 3003, next to
-   `/poolNodes`): `{ readyNodes, receiptFloor, inFlight }` where `receiptFloor` is the
-   **maximum** `receipt_floor` over ready reth nodes. bg-rpc-proxy proxies it to the
-   edge (Phase 1c).
+   `/poolNodes`): `{ readyNodes, receiptFloor, inFlight }` where a ready node is a
+   reth node with a non-null `receipt_floor`, and `receiptFloor` is the **maximum**
+   `receipt_floor` over ready nodes. bg-rpc-proxy proxies it to the edge (Phase 1c).
 8. **Keep heavy-method timeouts out of node ratings.** bg-rpc-logs computes a node's
    timeout rate by exact match on the status string `timeout_error` in
    `poolNodes.log` (`utils/metricsCalculators.js` ~line 430); it doesn't look at the
@@ -559,8 +595,8 @@ block; Phase 1 changes stay (they are independently beneficial).
 
 | Repo | Phase | Files |
 |---|---|---|
-| bg-rpc-pool | 1a, 2b, 3 | `pool.js` (Socket.IO options, `/getlogsStatus` route), `config.js`, `utils/selectRandomClients.js`, `utils/handleRequestSingle.js` (no retry for heavy methods, `timeout_error_heavy` status), `utils/getPoolNodesObject.js` (expose `receipt_floor`, `getlogs_ready`) |
-| buidlguidl-client | 1b, 2 | `webSocketConnection.js`, `ethereum_clients/reth.js` |
+| bg-rpc-pool | 1a, 2b, 3 | `pool.js` (Socket.IO options, `/getlogsStatus` route), `config.js`, `utils/selectRandomClients.js`, `utils/handleRequestSingle.js` (no retry for heavy methods, `timeout_error_heavy` status), `utils/getPoolNodesObject.js` (expose `receipt_floor`) |
+| buidlguidl-client | 1b, 2 — **done** | `webSocketConnection.js` (`maxContentLength`, `receipt_floor` in check-in), `ethereum_client_scripts/reth.js` (flags), new `ethereum_client_scripts/rethReceiptFloor.js` |
 | bg-rpc-proxy | 1c, 1e | `proxy.js` (batch/fallback logic, `/getlogsStatus` proxy route, `compression()`), `config.js`, `utils/validateRpcRequest.js`, `utils/handleRequest.js`, `utils/telegramUtils.js`, `package.json` (add `compression`) |
 | rpc-ssl-proxy (edge) | 1d, 1e, 4, 5 | `proxy.js`, `config.js`, `package.json` (add `compression`), `utils/requestValidator.js`, `utils/backgroundTasks.js` (usage flush), new `utils/apiKeys.js`, `utils/getLogsPolicy.js`, `utils/apiKeyMeter.js`, `database_scripts/createApiKeyTables.js`, `database_scripts/manageApiKeys.js`, `.env.example` |
 | bg-rpc-web-server | 5 | new `routes/apikeys.js`, nav link in `webServer.js` |
@@ -580,9 +616,14 @@ block; Phase 1 changes stay (they are independently beneficial).
 
 ## Risks
 
-- **Pool nodes on old client versions** never get getLogs (by design); if too few
-  upgrade, capacity is low. Mitigation: the `/admin/getlogs/status` endpoint shows
-  ready-node count; hold rollout until ≥ 5.
+- **Pool nodes on old client versions** never get getLogs, because they don't
+  report `receipt_floor` and a null floor is ineligible. If too few operators
+  upgrade, capacity is low. Mitigation: `/getlogsStatus` (and the edge's
+  `/admin/getlogs/status`) shows the ready-node count; hold rollout until ≥ 5.
+- **`receipt_floor` may be null on some datadir layouts.** The static-file header
+  reader is verified on reth v2.5.0's layout only. A node whose datadir it can't
+  parse is simply never eligible; watch the ready-node count against the number of
+  reth nodes on the new client to spot this.
 - **Receipt floor varies per node.** Using the maximum L across ready nodes is
   conservative; a node with a deeper floor is simply never asked for older ranges.
 - **Quotas in fixed UTC buckets** allow a 2× burst at the boundary. Acceptable at
