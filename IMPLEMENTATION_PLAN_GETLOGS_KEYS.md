@@ -45,7 +45,7 @@ For getLogs only. Other methods keep current values; aligning them is a separate
 | Layer | Now | Target | Rule |
 |---|---|---|---|
 | reth (node) | none | none | node caps bound the work instead |
-| buidlguidl-client → reth (axios) | none | **4 s**, `maxContentLength` 20 MB | returns an error instead of hanging or disconnecting; must be shorter than the pool's timeout so the pool sees an error, not a timeout |
+| buidlguidl-client → reth (axios) | none | **4 s**, `maxContentLength` 32 MB | returns an error instead of hanging or disconnecting; must be shorter than the pool's timeout so the pool sees an error, not a timeout |
 | Pool per-node | 10 s + retry on 2nd node | **5 s, no retry** | slowest 10k query ~1.6 s |
 | bg-rpc-proxy → pool | 15 s (+10 s fallback) | **8 s, no fallback** | > pool total |
 | Edge → bg-rpc-proxy | 15 s (+ fallback, + breaker) | **12 s, no fallback, not counted by the breaker** | > bg-rpc-proxy total |
@@ -91,9 +91,21 @@ fallback bill and node disconnects immediately.
 
 File: `pool.js` (~line 170, `new Server(wsServer, {...})`).
 
-- `maxHttpBufferSize: 20e6` (20 MB). Must exceed the largest response any method can
-  return: receipts up to 1.7 MB today, getLogs ~6.5 MB at a 10k-log cap, `eth_getProof`
-  unbounded (capped at the edge in Phase 4). The limit is on the *uncompressed* size.
+- `maxHttpBufferSize: 64e6` (64 MB). This is a per-message ceiling, not a
+  reservation: memory is used only by messages that actually arrive, so headroom is
+  free. Exceeding it **disconnects the node** (the 1 MB failure in miniature), so it
+  must sit well above any legitimate response, including ones not measured
+  (`eth_simulateV1` return data, large `eth_call` results). It must also be strictly
+  larger than the node client's `maxContentLength` (1b, 32 MB), so an oversized
+  response always surfaces there as a JSON-RPC error with the socket intact, and
+  this limit only ever catches something that bypassed the client cap. 64 MB keeps
+  the blast radius of a single rogue message (buffer + parsed objects, ~5–10× the
+  JSON size, on one event loop) survivable. The limit applies to the *uncompressed*
+  size.
+
+  Size-cap hierarchy, outermost to innermost: reth `--rpc.max-response-size`
+  160 MB (default) > pool 64 MB > node client 32 MB > edge getLogs response cap
+  20 MB. Each is ≥ 2× the one inside it.
 - `perMessageDeflate: { threshold: 1024 }`. The node clients already offer it.
   Measured 9–10× on logs and receipts.
 - Memory note: each connection keeps a zlib context; with ~16 nodes this is
@@ -112,8 +124,11 @@ in the `rpc_request` handler).
 
 - Add `timeout` (per method: **4 s** for getLogs / filter methods, **2.5 s**
   otherwise; each below the pool's timeout for that method) and
-  `maxContentLength: 20e6`. Today the call has neither, so a slow or oversized
-  response is only ever cut off by the pool's timeout or the Socket.IO size limit.
+  `maxContentLength: 32e6`. This is the cap that carries the size policy for node
+  responses: it's half the pool's 64 MB Socket.IO limit, so an oversized response
+  always becomes a JSON-RPC error here, never a disconnect there. Today the call has
+  neither option, so a slow or oversized response is only ever cut off by the pool's
+  timeout or the Socket.IO size limit.
 - On either limit, reply with a JSON-RPC error (code `-32603`, message naming the
   limit) instead of hanging. The pool then gets an error, not a timeout, so the
   node's timeout rating isn't hurt.
