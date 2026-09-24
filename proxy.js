@@ -16,8 +16,12 @@ import { checkRateLimit, buildRateLimitResponse, getRateLimitStatus, startRateLi
 import { validateRpcRequest } from './utils/requestValidator.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
-import { defaultRequestCount, methodRequestCounts, forwardedHeaders } from './config.js';
+import {
+  defaultRequestCount, methodRequestCounts, forwardedHeaders,
+  getLogsMethods, getLogsGlobalConcurrency, getLogsUpstreamTimeoutMs, getLogsMaxResponseBytes
+} from './config.js';
 import { redactUrl } from './utils/redactUrl.js';
+import { validateGetLogs, startGetLogsPollers, getGetLogsState } from './utils/getLogsPolicy.js';
 
 var app = express();
 https.globalAgent.options.ca = sslRootCas.create();
@@ -35,6 +39,22 @@ const fallbackUrl = process.env.FALLBACK_URL;
 console.log(`🔧 RPC Proxy Configuration:`);
 console.log(`   Primary URL: ${targetUrl || 'NOT SET'}`);
 console.log(`   Fallback URL: ${redactUrl(fallbackUrl)}`);
+
+// Stage-only switch (plan D10, Phase 4 policy pass): let getLogs through the policy
+// path WITHOUT an API key so the whole chain can be proven before keys exist. It
+// refuses to start unless TARGET_URL is a stage host or localhost, so it can't be
+// left on in production by accident. Removed when the keys pass lands.
+const getLogsKeylessStage = ['1', 'true', 'yes'].includes(String(process.env.GETLOGS_KEYLESS_STAGE || '').toLowerCase());
+if (getLogsKeylessStage) {
+  let host = '';
+  try { host = new URL(targetUrl).hostname; } catch { /* handled below */ }
+  const isStageHost = /^stage\./i.test(host) || host === 'localhost' || host === '127.0.0.1';
+  if (!isStageHost) {
+    console.error(`GETLOGS_KEYLESS_STAGE is set but TARGET_URL host "${host || targetUrl}" is not a stage host (stage.*) or localhost. Refusing to start.`);
+    process.exit(1);
+  }
+  console.log(`⚠️  GETLOGS_KEYLESS_STAGE is ON: getLogs is served without an API key (stage only, target ${host})`);
+}
 
 // Initialize circuit breaker
 const circuitBreaker = new CircuitBreaker({
@@ -154,6 +174,26 @@ async function makeFallbackRequest(data, headers) {
   });
 }
 
+// getLogs-path in-flight counter (edge-wide cap, D8).
+let getLogsInFlight = 0;
+
+// Forward a getLogs-path request to bg-rpc-proxy. Differences from
+// makePrimaryRequest: its own (longer) timeout, a response size cap, and it never
+// touches the circuit breaker or the fallback: a getLogs failure is returned to the
+// caller as JSON-RPC, never retried on a paid provider (plan 4c step 5).
+async function makeGetLogsRequest(data, headers) {
+  return axios.post(targetUrl, data, {
+    headers: upstreamHeaders(headers),
+    timeout: getLogsUpstreamTimeoutMs,
+    maxContentLength: getLogsMaxResponseBytes,
+    maxBodyLength: getLogsMaxResponseBytes
+  });
+}
+
+function jsonRpcError(id, code, message) {
+  return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
+}
+
 // Helper function to make primary requests with circuit breaker
 async function makePrimaryRequest(method, url, data, headers, timeout = 15000) {
   const controller = new AbortController();
@@ -218,18 +258,16 @@ app.post("/", async (req, res) => {
     return;
   }
   
-  // Block eth_getLogs - too resource-intensive to proxy
-  {
-    const requests = Array.isArray(req.body) ? req.body : [req.body];
-    const hasGetLogs = requests.some(r => r?.method === 'eth_getLogs');
-    if (hasGetLogs) {
-      const requestId = Array.isArray(req.body) ? (req.body[0]?.id ?? null) : (req.body?.id ?? null);
-      console.log(`🚫 Blocked eth_getLogs from ${clientIP}`);
-      res.status(429)
-        .set('Retry-After', String(getSecondsUntilNextHour()))
-        .json(buildRateLimitResponse(requestId));
-      return;
-    }
+  // getLogs and the filter methods (D9). Without the stage switch they are blocked
+  // for everyone (today's behavior; the keys pass replaces this with -32601). With it,
+  // they take the policy path below, after the rate limiter.
+  const heavyItems = (Array.isArray(req.body) ? req.body : [req.body]).filter(r => getLogsMethods.includes(r?.method));
+  if (heavyItems.length > 0 && !getLogsKeylessStage) {
+    console.log(`🚫 Blocked ${heavyItems.map(r => r.method).join(',')} from ${clientIP}`);
+    res.status(429)
+      .set('Retry-After', String(getSecondsUntilNextHour()))
+      .json(buildRateLimitResponse(requestIdOf(req.body)));
+    return;
   }
 
   // Check rate limit before any other processing
@@ -253,6 +291,55 @@ app.post("/", async (req, res) => {
     return;
   }
   
+  // ---- getLogs policy path (plan 4c/4d, policy pass) ----------------------------
+  if (heavyItems.length > 0) {
+    // 1. validate every heavy item; the first failure answers the whole request
+    for (const item of heavyItems) {
+      const verdict = validateGetLogs(item);
+      if (!verdict.ok) {
+        console.log(`🪵 getLogs rejected (${item.method}) from ${clientIP}: ${verdict.error.code} ${verdict.error.message}`);
+        res.status(200).json(jsonRpcError(item.id, verdict.error.code, verdict.error.message));
+        return;
+      }
+    }
+
+    // 2. edge-wide capacity
+    if (getLogsInFlight >= getLogsGlobalConcurrency) {
+      console.log(`🪵 getLogs capacity: ${getLogsInFlight} in flight, rejecting request from ${clientIP}`);
+      res.status(429)
+        .set('Retry-After', '2')
+        .json(jsonRpcError(requestIdOf(req.body), -32005, 'getLogs capacity exhausted at the edge, retry shortly'));
+      return;
+    }
+
+    // 3. forward: own timeout, size cap, no breaker, no fallback
+    getLogsInFlight++;
+    const startedAt = Date.now();
+    try {
+      const response = await makeGetLogsRequest(req.body, req.headers);
+      res.status(200).send(response.data);
+      console.log(`🪵 getLogs served (${heavyItems.map(r => r.method).join(',')}) from ${clientIP} in ${Date.now() - startedAt} ms, upstream ${response.headers?.['content-length'] ?? '?'} bytes`);
+    } catch (error) {
+      const tooLarge = /maxContentLength|maxBodyLength/i.test(error.message || '');
+      console.log(`🪵 getLogs upstream error after ${Date.now() - startedAt} ms: ${error.code || 'no code'} ${error.message}`);
+      res.status(200).json(jsonRpcError(
+        requestIdOf(req.body),
+        -32603,
+        tooLarge ? 'Internal error: response too large' : 'Internal error: upstream request failed'
+      ));
+    } finally {
+      getLogsInFlight--;
+    }
+
+    // Count toward the IP/origin limiter like any other served request (weighted).
+    const requests = Array.isArray(req.body) ? req.body : [req.body];
+    const requestCount = requests.reduce((sum, r) => sum + (methodRequestCounts[r?.method] ?? defaultRequestCount), 0);
+    updateIpCountMap(clientIP, req.headers.origin, requestCount);
+    if (req.headers.origin) updateUrlCountMap(req.headers.origin, requestCount);
+    return;
+  }
+  // ---- end getLogs policy path ---------------------------------------------------
+
   const isUsingFallback = circuitBreaker.isCurrentlyUsingFallback();
   const currentUrl = circuitBreaker.getCurrentUrl();
   
@@ -561,6 +648,12 @@ app.get("/status", (req, res) => {
     const status = circuitBreaker.getStatus();
     res.json({
       circuitBreaker: status,
+      getLogs: {
+        keylessStage: getLogsKeylessStage,
+        edgeInFlight: getLogsInFlight,
+        edgeConcurrencyCap: getLogsGlobalConcurrency,
+        ...getGetLogsState()
+      },
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -605,6 +698,11 @@ startRateLimitPolling();
 
 // Start IP blacklist watcher
 startWatchingBlacklist();
+
+// Head + receipt-floor pollers for the getLogs policy (only needed while the path is open)
+if (getLogsKeylessStage) {
+  startGetLogsPollers(targetUrl);
+}
 
 // PORT is only for running a second instance next to the live one (tests); the
 // service itself listens on 443.

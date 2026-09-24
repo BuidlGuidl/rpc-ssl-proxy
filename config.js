@@ -78,6 +78,37 @@ const maxBatchLength = 50;
  */
 const forwardedHeaders = ['user-agent', 'origin'];
 
+// =============================================================================
+// GETLOGS POLICY (bg-rpc-docs plan, Phase 4 policy pass; D1, D8, D9)
+// =============================================================================
+
+/** Methods that get the getLogs policy and forwarding path (D9). */
+const getLogsMethods = ['eth_getLogs', 'eth_newFilter', 'eth_getFilterLogs', 'eth_getFilterChanges'];
+
+/** Max blocks per getLogs call (D1). Over this → -32602 with a suggested range. */
+const getLogsMaxBlockRange = 10000;
+
+/** Sanity caps on the filter object; reth handles anything finer. */
+const getLogsMaxAddresses = 10;
+const getLogsMaxTopics = 4;
+
+/** Edge-wide in-flight cap for getLogs-path requests (D8). Over this → -32005, HTTP 429. */
+const getLogsGlobalConcurrency = 16;
+
+/** Edge → bg-rpc-proxy timeout for the getLogs path (ms). Must exceed bg-rpc-proxy's 8 s. */
+const getLogsUpstreamTimeoutMs = 12000;
+
+/** Largest getLogs-path response the edge will accept from upstream (bytes). */
+const getLogsMaxResponseBytes = 20e6;
+
+/** How often the edge refreshes the chain head (eth_blockNumber to TARGET_URL) and the pool's receipt floor (/getlogsStatus). Seconds. */
+const getLogsHeadPollInterval = 12;
+const getLogsFloorPollInterval = 60;
+
+/** A head or floor older than this is treated as unknown (getLogs fails closed). Seconds. */
+const getLogsHeadMaxAge = 120;
+const getLogsFloorMaxAge = 600;
+
 export {
   usdcAddress,
   // rpcFunderContractAddress,
@@ -91,5 +122,16 @@ export {
   defaultRequestCount,
   methodRequestCounts,
   maxBatchLength,
-  forwardedHeaders
+  forwardedHeaders,
+  getLogsMethods,
+  getLogsMaxBlockRange,
+  getLogsMaxAddresses,
+  getLogsMaxTopics,
+  getLogsGlobalConcurrency,
+  getLogsUpstreamTimeoutMs,
+  getLogsMaxResponseBytes,
+  getLogsHeadPollInterval,
+  getLogsFloorPollInterval,
+  getLogsHeadMaxAge,
+  getLogsFloorMaxAge
 };
