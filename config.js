@@ -63,6 +63,21 @@ const methodRequestCounts = {
   eth_getBlockByHash: 2,
 };
 
+// =============================================================================
+// EDGE HYGIENE (bg-rpc-docs plan, Phase 1d)
+// =============================================================================
+
+/** Max items in a JSON-RPC batch. Larger batches get -32600 before anything is forwarded. */
+const maxBatchLength = 50;
+
+/**
+ * Caller headers (lowercase) that are forwarded upstream. Everything else is dropped:
+ * bg-rpc-proxy forwards headers to its fallback provider, so an X-Api-Key would leak;
+ * a forwarded Content-Length/Transfer-Encoding no longer matches the re-serialized
+ * body; and a forwarded Accept-Encoding overrides axios's own compression negotiation.
+ */
+const forwardedHeaders = ['user-agent', 'origin'];
+
 export {
   usdcAddress,
   // rpcFunderContractAddress,
@@ -74,5 +89,7 @@ export {
   ipRateLimitPerDay,
   rateLimitPollInterval,
   defaultRequestCount,
-  methodRequestCounts
+  methodRequestCounts,
+  maxBatchLength,
+  forwardedHeaders
 };

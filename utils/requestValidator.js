@@ -11,6 +11,7 @@
  */
 
 import { logRejectedRequest } from './rejectLogger.js';
+import { maxBatchLength } from '../config.js';
 
 /**
  * Blocked RPC namespaces - these are dangerous or sensitive methods that should not be exposed
@@ -110,6 +111,18 @@ function validateRpcRequest(req, res, next) {
           "Invalid Request: Batch request cannot be empty",
           null,
           "empty batch array"
+        );
+      }
+
+      // Batch cap: the edge is the first layer to reject, so nothing downstream sees it
+      if (req.body.length > maxBatchLength) {
+        console.log(`‼️ Invalid Request: batch of ${req.body.length} exceeds max ${maxBatchLength}`);
+        return sendErrorAndLog(
+          req, res,
+          -32600,
+          `Batch too large (max ${maxBatchLength})`,
+          req.body[0]?.id ?? null,
+          `batch too large (${req.body.length} > ${maxBatchLength})`
         );
       }
 

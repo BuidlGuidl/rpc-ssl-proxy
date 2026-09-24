@@ -4,6 +4,8 @@ import axios from "axios";
 import fs from "fs";
 import cors from "cors";
 import bodyParser from "body-parser";
+import compression from "compression";
+import zlib from "zlib";
 import { fileURLToPath } from 'url';
 import ethers from "ethers";
 import sslRootCas from "ssl-root-cas";
@@ -14,7 +16,8 @@ import { checkRateLimit, buildRateLimitResponse, getRateLimitStatus, startRateLi
 import { validateRpcRequest } from './utils/requestValidator.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
-import { defaultRequestCount, methodRequestCounts } from './config.js';
+import { defaultRequestCount, methodRequestCounts, forwardedHeaders } from './config.js';
+import { redactUrl } from './utils/redactUrl.js';
 
 var app = express();
 https.globalAgent.options.ca = sslRootCas.create();
@@ -31,7 +34,7 @@ const fallbackUrl = process.env.FALLBACK_URL;
 
 console.log(`🔧 RPC Proxy Configuration:`);
 console.log(`   Primary URL: ${targetUrl || 'NOT SET'}`);
-console.log(`   Fallback URL: ${fallbackUrl || 'NOT SET'}`);
+console.log(`   Fallback URL: ${redactUrl(fallbackUrl)}`);
 
 // Initialize circuit breaker
 const circuitBreaker = new CircuitBreaker({
@@ -42,6 +45,16 @@ const circuitBreaker = new CircuitBreaker({
   requestTimeout: 15000 // 15 second timeout
 });
 
+// Edge → client compression (bg-rpc-docs plan, Phase 1e). Size-selected: responses
+// under 1 KB are sent as-is, so eth_call / eth_blockNumber never touch zlib. Level 1
+// for gzip/deflate and brotli quality 1 (the package default, q4, costs ~3× the CPU
+// for a modest size gain on JSON-RPC bodies). Clients that don't send Accept-Encoding
+// get plain JSON.
+app.use(compression({
+  threshold: 1024,
+  level: zlib.constants.Z_BEST_SPEED,
+  brotli: { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 1 } }
+}));
 app.use(bodyParser.json());
 app.use(cors());
 
@@ -95,6 +108,31 @@ function getOrigin(req) {
   }
 }
 
+// Build the header set for the next hop. Only the allowlisted caller headers cross
+// (see forwardedHeaders in config.js); Content-Type is always ours because the body
+// is re-serialized from req.body.
+function upstreamHeaders(clientHeaders) {
+  const headers = { "Content-Type": "application/json" };
+  for (const name of forwardedHeaders) {
+    const value = clientHeaders?.[name];
+    if (typeof value === 'string' && value !== '') {
+      headers[name] = value;
+    }
+  }
+  return headers;
+}
+
+// JSON-RPC id to echo in an error response: the request's id, or the first item's
+// id for a batch (the convention every other error path here already uses).
+function requestIdOf(body) {
+  try {
+    if (Array.isArray(body)) return body[0]?.id ?? null;
+    return body?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // Helper function to make fallback requests with consistent settings
 async function makeFallbackRequest(data, headers) {
   if (!fallbackUrl || fallbackUrl.trim() === '') {
@@ -125,10 +163,7 @@ async function makePrimaryRequest(method, url, data, headers, timeout = 15000) {
     const config = {
       method,
       url,
-      headers: {
-        "Content-Type": "application/json",
-        ...headers,
-      },
+      headers: upstreamHeaders(headers),
       signal: controller.signal,
       timeout
     };
@@ -276,7 +311,7 @@ app.post("/", async (req, res) => {
         actuallyUsedFallback = true;
         
         response = await makeFallbackRequest(req.body, req.headers);
-        console.log("POST FALLBACK SUCCESS", response.data);
+        console.log("POST FALLBACK SUCCESS", response.status, `${response.headers?.['content-length'] ?? '?'} bytes`);
         
         // Early return - don't count in Firebase since we used fallback
         responseData = response.data;
@@ -293,9 +328,16 @@ app.post("/", async (req, res) => {
     console.log("POST ERROR", error.message, isUsingFallback ? "(FALLBACK)" : "(PRIMARY)");
     console.log(`   Error details: ${error.code || 'No code'} - ${error.response?.status || 'No status'}`);
     
-    res
-      .status(error.response ? error.response.status : 500)
-      .send(error.message);
+    // Always JSON-RPC, always HTTP 200, like every other error path. The detail stays
+    // in the log: error.message can name internal hosts and ports.
+    res.status(200).json({
+      jsonrpc: "2.0",
+      id: requestIdOf(req.body),
+      error: {
+        code: -32603,
+        message: "Internal error: upstream request failed"
+      }
+    });
     return; // Don't count failed requests in Firebase
   }
 
@@ -380,7 +422,7 @@ app.get("/", async (req, res) => {
     try {
       // Use a simple axios call for GET requests (no circuit breaker)
       const response = await axios.get(targetUrl, {
-        headers: { ...req.headers },
+        headers: upstreamHeaders(req.headers),
         timeout: 10000
       });
       console.log("GET RESPONSE", response.data);
@@ -393,7 +435,7 @@ app.get("/", async (req, res) => {
         try {
           console.log("🔄 Trying GET with fallback URL...");
           const fallbackResponse = await axios.get(fallbackUrl, {
-            headers: { ...req.headers },
+            headers: upstreamHeaders(req.headers),
             timeout: 10000,
             httpsAgent: new https.Agent({
               rejectUnauthorized: false
@@ -427,8 +469,8 @@ app.get("/proxy", (req, res) => {
       "<html><body><div style='padding:20px;font-size:18px'>" +
       "<H1>PROXY TO:</H1>" +
       "<div><strong>Primary:</strong> " + targetUrl + "</div>" +
-      "<div><strong>Fallback:</strong> " + fallbackUrl + "</div>" +
-      "<div><strong>Current:</strong> " + status.currentUrl + "</div>" +
+      "<div><strong>Fallback:</strong> " + redactUrl(fallbackUrl) + "</div>" +
+      "<div><strong>Current:</strong> " + status.currentTarget + "</div>" +
       "<div><strong>Status:</strong> " + status.state + "</div>" +
       "<div><strong>Using Fallback:</strong> " + status.isUsingFallback + "</div>" +
       "<div><strong>Consecutive Failures:</strong> " + status.consecutiveFailures + "</div>" +
@@ -511,16 +553,14 @@ app.get("/watchdog", (req, res) => {
   }
 });
 
-// Add circuit breaker status endpoint
+// Circuit breaker status. Unauthenticated, so it carries state only: no URLs (the
+// fallback URL holds the provider key). Anything sensitive added later (key usage in
+// Phase 4) goes behind requireAdminKey, not here.
 app.get("/status", (req, res) => {
   try {
     const status = circuitBreaker.getStatus();
     res.json({
       circuitBreaker: status,
-      urls: {
-        primary: targetUrl,
-        fallback: fallbackUrl
-      },
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -566,6 +606,10 @@ startRateLimitPolling();
 // Start IP blacklist watcher
 startWatchingBlacklist();
 
+// PORT is only for running a second instance next to the live one (tests); the
+// service itself listens on 443.
+const listenPort = Number(process.env.PORT) || 443;
+
 let key, cert;
 try {
   key = fs.readFileSync("server.key");
@@ -583,6 +627,6 @@ https
     },
     app
   )
-  .listen(443, () => {
-    console.log("Listening 443...");
+  .listen(listenPort, () => {
+    console.log(`Listening ${listenPort}...`);
   });

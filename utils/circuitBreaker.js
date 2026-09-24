@@ -1,5 +1,6 @@
 // Circuit breaker for managing fallback between primary and secondary RPC providers
 import { sendTelegramAlert } from './telegramUtils.js';
+import { redactUrl } from './redactUrl.js';
 
 class CircuitBreaker {
   constructor(options = {}) {
@@ -27,13 +28,13 @@ class CircuitBreaker {
     this.isUsingFallback = false;
     this.previousState = 'CLOSED'; // Track state changes for alerts
     
-    console.log(`Circuit breaker initialized - Primary: ${this.primaryUrl}, Fallback: ${this.fallbackUrl}`);
+    console.log(`Circuit breaker initialized - Primary: ${this.primaryUrl}, Fallback: ${redactUrl(this.fallbackUrl)}`);
   }
 
   // Send alert when circuit opens
   sendOpenAlert() {
     try {
-      const message = `------------------------------------------\n🔴 ALERT: Pre-Proxy ${this.name} circuit breaker is open. Using fallback url\nFallback URL: ${this.fallbackUrl}`;
+      const message = `------------------------------------------\n🔴 ALERT: Pre-Proxy ${this.name} circuit breaker is open. Using fallback url\nFallback URL: ${redactUrl(this.fallbackUrl)}`;
       sendTelegramAlert(message, 'CIRCUIT_OPEN');
     } catch (error) {
       console.error('❌ Failed to send circuit open alert:', error.message);
@@ -149,7 +150,7 @@ class CircuitBreaker {
       state: this.state,
       consecutiveFailures: this.consecutiveFailures,
       isUsingFallback: this.isUsingFallback,
-      currentUrl: this.getCurrentUrl(),
+      currentTarget: this.getCurrentUrl() === this.primaryUrl ? 'primary' : 'fallback',
       lastFailureTime: this.lastFailureTime
     };
   }
