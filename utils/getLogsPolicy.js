@@ -180,6 +180,18 @@ function resolveBlock(raw, field, head) {
 }
 
 /**
+ * The filter object of an eth_getLogs / eth_newFilter item. Reth accepts both the
+ * positional form (params: [filter]) and the by-name form (params: {filter: {...}});
+ * the pool reads both (1c follow-up), so the edge must too or by-name requests would
+ * skip the range cap, floor check and tag rules.
+ */
+function extractFilter(params) {
+  if (Array.isArray(params)) return params[0];
+  if (params && typeof params === 'object') return params.filter;
+  return undefined;
+}
+
+/**
  * Validate one JSON-RPC item on the getLogs path.
  * @param {object} item - { method, params, id }
  * @returns {{ ok: boolean, error?: { code: number, message: string }, blockCount: number }}
@@ -198,9 +210,9 @@ function validateGetLogs(item) {
     return { ok: false, error: { code: -32603, message: 'getLogs not ready' }, blockCount: 0 };
   }
 
-  const filter = Array.isArray(item?.params) ? item.params[0] : undefined;
+  const filter = extractFilter(item?.params);
   if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
-    return invalid('Invalid params: expected a filter object as the first parameter');
+    return invalid('Invalid params: expected a filter object, positional (params[0]) or by name (params.filter)');
   }
 
   // Shape sanity
