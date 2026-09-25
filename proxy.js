@@ -14,6 +14,7 @@ import { updateUrlCountMap, updateIpCountMap, startBackgroundTasks } from './uti
 import { CircuitBreaker } from './utils/circuitBreaker.js';
 import { checkRateLimit, buildRateLimitResponse, getRateLimitStatus, startRateLimitPolling, getSecondsUntilNextHour } from './utils/rateLimiter.js';
 import { validateRpcRequest } from './utils/requestValidator.js';
+import { rejectDisabledMethods } from './utils/disabledMethods.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
 import {
@@ -80,6 +81,9 @@ app.use(cors());
 
 // Validate RPC requests early to avoid forwarding invalid requests to downstream service
 app.use(validateRpcRequest);
+
+// Filter ("ticket") methods are off (D15): answered here, before anything else
+app.use(rejectDisabledMethods);
 
 var last = "";
 

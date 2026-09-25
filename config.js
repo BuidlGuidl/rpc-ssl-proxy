@@ -82,7 +82,24 @@ const forwardedHeaders = ['user-agent', 'origin'];
 // GETLOGS POLICY (bg-rpc-docs plan, Phase 4 policy pass; D1, D8, D9)
 // =============================================================================
 
-/** Methods that get the getLogs policy and forwarding path (D9). */
+/**
+ * Methods rejected at the edge with -32601 "<method> is not supported on this
+ * endpoint; use eth_getLogs" (bg-rpc-docs plan, D15). Mirrors `disabledMethods` in
+ * bg-rpc-pool/config.js: a filter id exists only on the node that created it, so
+ * follow-up calls fail once there is more than one node. Rejected right after
+ * validation, before key checks, the rate limiter and metering; re-enable here and
+ * in the pool together once filter-id → node routing exists (after Phase 3b).
+ */
+const disabledMethods = [
+  'eth_newFilter',
+  'eth_newBlockFilter',
+  'eth_newPendingTransactionFilter',
+  'eth_getFilterChanges',
+  'eth_getFilterLogs',
+  'eth_uninstallFilter'
+];
+
+/** Methods that get the getLogs policy and forwarding path (D9). While D15 is in force the filter methods never reach this path. */
 const getLogsMethods = ['eth_getLogs', 'eth_newFilter', 'eth_getFilterLogs', 'eth_getFilterChanges'];
 
 /** Max blocks per getLogs call (D1). Over this → -32602 with a suggested range. */
@@ -123,6 +140,7 @@ export {
   methodRequestCounts,
   maxBatchLength,
   forwardedHeaders,
+  disabledMethods,
   getLogsMethods,
   getLogsMaxBlockRange,
   getLogsMaxAddresses,
