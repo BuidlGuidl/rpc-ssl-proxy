@@ -7,7 +7,9 @@
  *   - head: eth_blockNumber to TARGET_URL every getLogsHeadPollInterval seconds
  *     (bg-rpc-proxy answers from its cache; no node sees it)
  *   - floor: GET <TARGET_URL origin>/getlogsStatus every getLogsFloorPollInterval
- *     seconds (the pool's max receipt_floor over ready reth nodes)
+ *     seconds (the lowest receipt_floor among ready reth nodes, D14: the oldest
+ *     block any ready node can serve; the pool routes each request to nodes whose
+ *     floor covers it)
  * Fail closed: until both are known and fresh, getLogs returns -32603 "getLogs not
  * ready". RECEIPT_FLOOR_OVERRIDE (env) pins the floor and is the only manual path.
  */
@@ -256,7 +258,7 @@ function validateGetLogs(item) {
   }
 
   if (from.value < floor) {
-    return invalid(`Logs older than block ${floor} are not available on this endpoint (history is ~100 days).`);
+    return invalid(`Logs older than block ${floor} are not available on this endpoint.`);
   }
 
   return { ok: true, blockCount };

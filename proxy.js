@@ -13,12 +13,12 @@ import dotenv from "dotenv";
 import { updateUrlCountMap, updateIpCountMap, startBackgroundTasks } from './utils/backgroundTasks.js';
 import { CircuitBreaker } from './utils/circuitBreaker.js';
 import { checkRateLimit, buildRateLimitResponse, getRateLimitStatus, startRateLimitPolling, getSecondsUntilNextHour } from './utils/rateLimiter.js';
-import { validateRpcRequest } from './utils/requestValidator.js';
+import { validateRpcRequest, rejectBodyErrors } from './utils/requestValidator.js';
 import { rejectDisabledMethods } from './utils/disabledMethods.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
 import {
-  forwardedHeaders,
+  forwardedHeaders, maxRequestBodySize,
   getLogsMethods, getLogsGlobalConcurrency, getLogsUpstreamTimeoutMs, getLogsMaxResponseBytes
 } from './config.js';
 import { redactUrl } from './utils/redactUrl.js';
@@ -77,8 +77,13 @@ app.use(compression({
   level: zlib.constants.Z_BEST_SPEED,
   brotli: { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 1 } }
 }));
-app.use(bodyParser.json());
+// CORS first, so every answer below (including body errors) carries the headers.
 app.use(cors());
+// Parse the body as JSON whatever the Content-Type says (curl -d sends
+// x-www-form-urlencoded, browser fetch with a string body sends text/plain), capped
+// at maxRequestBodySize; parser failures are answered as JSON-RPC by rejectBodyErrors.
+app.use(bodyParser.json({ limit: maxRequestBodySize, type: () => true }));
+app.use(rejectBodyErrors);
 
 // Validate RPC requests early to avoid forwarding invalid requests to downstream service
 app.use(validateRpcRequest);
@@ -158,6 +163,12 @@ function requestIdOf(body) {
   }
 }
 
+// The fallback is a public provider and its URL carries the API key, so its
+// certificate is verified. Explicit, because line ~31 sets NODE_TLS_REJECT_UNAUTHORIZED=0
+// for the process (the internal hops use self-signed certificates), which turns
+// verification off for every agent that doesn't say otherwise.
+const fallbackAgent = new https.Agent({ rejectUnauthorized: true });
+
 // Helper function to make fallback requests with consistent settings
 async function makeFallbackRequest(data, headers) {
   if (!fallbackUrl || fallbackUrl.trim() === '') {
@@ -173,9 +184,7 @@ async function makeFallbackRequest(data, headers) {
     headers: cleanHeaders,
     timeout: 15000,
     maxRedirects: 0,
-    httpsAgent: new https.Agent({
-      rejectUnauthorized: false
-    })
+    httpsAgent: fallbackAgent
   });
 }
 
@@ -352,7 +361,7 @@ app.post("/", async (req, res) => {
   const isUsingFallback = circuitBreaker.isCurrentlyUsingFallback();
   const currentUrl = circuitBreaker.getCurrentUrl();
   
-  console.log(`📡 POST Request - Using ${isUsingFallback ? 'FALLBACK' : 'PRIMARY'}: ${currentUrl}`);
+  console.log(`📡 POST Request - Using ${isUsingFallback ? 'FALLBACK' : 'PRIMARY'}: ${redactUrl(currentUrl)}`);
   
   // Track if we actually used fallback for this request (either from circuit breaker or immediate retry)
   let actuallyUsedFallback = isUsingFallback;
@@ -403,7 +412,7 @@ app.post("/", async (req, res) => {
         console.log("POST ERROR", primaryError.message, "(PRIMARY)");
         
         // Primary failed, try fallback immediately
-        console.log(`🔄 Retrying with fallback URL: ${fallbackUrl}`);
+        console.log(`🔄 Retrying with fallback URL: ${redactUrl(fallbackUrl)}`);
         actuallyUsedFallback = true;
         
         response = await makeFallbackRequest(req.body, req.headers);
@@ -530,9 +539,7 @@ app.get("/", async (req, res) => {
           const fallbackResponse = await axios.get(fallbackUrl, {
             headers: upstreamHeaders(req.headers),
             timeout: 10000,
-            httpsAgent: new https.Agent({
-              rejectUnauthorized: false
-            })
+            httpsAgent: fallbackAgent
           });
           console.log("GET FALLBACK SUCCESS", fallbackResponse.data);
           res.status(fallbackResponse.status).send(fallbackResponse.data);

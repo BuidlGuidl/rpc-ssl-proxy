@@ -15,6 +15,7 @@
 
 import { disabledMethods } from '../config.js';
 import { logRejectedRequest } from './rejectLogger.js';
+import { spliceIntoBatchResponse } from './batchMerge.js';
 
 const disabledSet = new Set(disabledMethods);
 
@@ -73,31 +74,10 @@ function rejectDisabledMethods(req, res, next) {
       return;
     }
 
-    // Process the rest normally, then splice the errors back in at their positions.
+    // Process the rest normally, then splice the errors back in at their positions
+    // (utils/batchMerge.js; a whole-batch error object is sent as-is).
     req.body = remaining;
-    const originalSend = res.send;
-    let mergedOnce = false; // res.send(object) re-enters res.send(string) via res.json
-    res.send = function (body) {
-      if (mergedOnce) return originalSend.call(this, body);
-      mergedOnce = true;
-      let merged = body;
-      try {
-        let answers = body;
-        if (typeof body === 'string') {
-          try { answers = JSON.parse(body); } catch { answers = body; }
-        }
-        if (Array.isArray(answers)) {
-          merged = answers.slice();
-          for (const d of disabled) merged.splice(d.index, 0, d.response);
-          if (typeof body === 'string') merged = JSON.stringify(merged);
-        }
-        // A non-array body (a single error object for the whole batch) is sent as-is.
-      } catch (err) {
-        console.error('[disabledMethods] merge failed, sending upstream body unchanged:', err?.message || err);
-        merged = body;
-      }
-      return originalSend.call(this, merged);
-    };
+    spliceIntoBatchResponse(res, disabled);
     next();
   } catch (err) {
     // FAIL-OPEN like the validator: never take the proxy down over this check.

@@ -11,7 +11,8 @@
  */
 
 import { logRejectedRequest } from './rejectLogger.js';
-import { maxBatchLength } from '../config.js';
+import { spliceIntoBatchResponse } from './batchMerge.js';
+import { maxBatchLength, maxRequestBodySize } from '../config.js';
 
 /**
  * Blocked RPC namespaces - these are dangerous or sensitive methods that should not be exposed
@@ -78,6 +79,70 @@ function sendErrorAndLog(req, res, code, message, id, logReason) {
 }
 
 /**
+ * Why one JSON-RPC item is unacceptable, or null if it's fine.
+ * @returns {{ code: number, message: string, reason: string, namespace?: string } | null}
+ */
+function itemProblem(request) {
+  const jsonrpc = request?.jsonrpc;
+  const method = request?.method;
+  const id = request?.id;
+
+  if (!jsonrpc || jsonrpc !== "2.0" || !method || id === undefined) {
+    const reason = [];
+    if (!jsonrpc) reason.push('jsonrpc missing');
+    else if (jsonrpc !== "2.0") reason.push('jsonrpc must be "2.0"');
+    if (!method) reason.push('method missing');
+    if (id === undefined) reason.push('id missing');
+    const reasonStr = reason.join(", ");
+    return { code: -32600, message: `Invalid Request: ${reasonStr}`, reason: reasonStr };
+  }
+
+  const blockedNamespace = getBlockedNamespace(method);
+  if (blockedNamespace) {
+    return {
+      code: -32601,
+      message: `Method not supported: The '${blockedNamespace}' namespace is not available on this endpoint`,
+      reason: `blocked namespace '${blockedNamespace}' (method: ${method})`,
+      namespace: blockedNamespace
+    };
+  }
+  return null;
+}
+
+/**
+ * Express error middleware for body-parser failures, mounted right after
+ * bodyParser.json(). Answers JSON-RPC instead of Express's HTML error page:
+ *   entity.too.large   → HTTP 413, -32600 "Request body too large (max <limit>)"
+ *   entity.parse.failed → HTTP 400, -32700 "Parse error"
+ *   any other body-parser error (unsupported charset/encoding, aborted stream) →
+ *   its HTTP status, -32600 with the parser's message
+ * Everything else is passed on. These never reach the handler, so they cost no
+ * rate-limiter units; they are logged like the other rejections.
+ */
+function rejectBodyErrors(err, req, res, next) {
+  try {
+    if (!err || typeof err.type !== 'string' || typeof err.status !== 'number') {
+      next(err);
+      return;
+    }
+    let code, message;
+    if (err.type === 'entity.too.large') {
+      code = -32600; message = `Request body too large (max ${maxRequestBodySize})`;
+    } else if (err.type === 'entity.parse.failed') {
+      code = -32700; message = 'Parse error';
+    } else {
+      code = -32600; message = err.message || 'Invalid Request';
+    }
+    console.log(`‼️ Body rejected: ${err.type} (${err.status})`);
+    logRejectedRequest(req, `body: ${err.type}`);
+    res.status(err.status).json({ jsonrpc: "2.0", id: null, error: { code, message } });
+  } catch (e) {
+    try { console.error('[RequestValidator] rejectBodyErrors failed:', e?.message || e); } catch { /* ignore */ }
+    next(err);
+  }
+}
+
+/**
  * Express middleware to validate JSON-RPC 2.0 requests
  * Handles both single requests and batch requests (arrays)
  */
@@ -126,50 +191,41 @@ function validateRpcRequest(req, res, next) {
         );
       }
 
-      // Validate each request in the batch
+      // Validate each item. Invalid items are answered per item, at their position
+      // (JSON-RPC batch semantics; batch clients expect an array back). Valid items
+      // are processed normally and the answers are merged back in order.
+      const rejected = []; // { index, response }
+      const remaining = [];
+      const reasons = [];
       for (let i = 0; i < req.body.length; i++) {
         const request = req.body[i];
-        
-        // Safely extract fields with fallbacks
-        const jsonrpc = request?.jsonrpc;
-        const method = request?.method;
-        const id = request?.id;
-        
-        // Basic structure validation
-        if (!jsonrpc || jsonrpc !== "2.0" || !method || id === undefined) {
-          let reason = [];
-          if (!jsonrpc) reason.push('jsonrpc missing');
-          else if (jsonrpc !== "2.0") reason.push('jsonrpc must be "2.0"');
-          if (!method) reason.push('method missing');
-          if (id === undefined) reason.push('id missing');
-          
-          const reasonStr = reason.join(", ");
-          console.log(`‼️ Invalid Request in batch item ${i}: ${reasonStr}`);
+        const problem = itemProblem(request);
+        if (!problem) {
+          remaining.push(request);
+          continue;
+        }
+        if (problem.code === -32601) {
+          console.log(`🚫 Blocked namespace in batch item ${i}: ${problem.namespace} (method: ${request.method})`);
+        } else {
+          console.log(`‼️ Invalid Request in batch item ${i}: ${problem.reason}`);
           console.log("Request object:", request);
-
-          return sendErrorAndLog(
-            req, res,
-            -32600,
-            `Invalid Request: Batch item ${i}: ${reasonStr}`,
-            id ?? null,
-            `batch[${i}]: ${reasonStr}`
-          );
         }
-
-        // Namespace validation
-        const blockedNamespace = getBlockedNamespace(method);
-        if (blockedNamespace) {
-          console.log(`🚫 Blocked namespace in batch item ${i}: ${blockedNamespace} (method: ${method})`);
-          return sendErrorAndLog(
-            req, res,
-            -32601,
-            `Method not supported: The '${blockedNamespace}' namespace is not available on this endpoint`,
-            id,
-            `batch[${i}]: blocked namespace '${blockedNamespace}' (method: ${method})`
-          );
-        }
+        reasons.push(`batch[${i}]: ${problem.reason}`);
+        rejected.push({
+          index: i,
+          response: { jsonrpc: "2.0", id: request?.id ?? null, error: { code: problem.code, message: problem.message } }
+        });
       }
-      
+
+      if (rejected.length > 0) {
+        logRejectedRequest(req, reasons.join('; '));
+        if (remaining.length === 0) {
+          return res.status(200).send(rejected.map(r => r.response));
+        }
+        req.body = remaining;
+        spliceIntoBatchResponse(res, rejected);
+      }
+
       // Mark as batch request for the handler
       req.isBatchRequest = true;
       next();
@@ -228,4 +284,4 @@ function validateRpcRequest(req, res, next) {
   }
 }
 
-export { validateRpcRequest, BLOCKED_NAMESPACES };
+export { validateRpcRequest, rejectBodyErrors, BLOCKED_NAMESPACES };

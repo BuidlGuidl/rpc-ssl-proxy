@@ -57,6 +57,14 @@ const rateLimitPollInterval = 10;   // How often to poll DB for rate limit data 
 const maxBatchLength = 50;
 
 /**
+ * Max request body (body-parser limit string). Exactly what bg-rpc-proxy accepts: a
+ * larger edge limit would let oversized bodies through to an HTTP 413 downstream,
+ * which the circuit breaker counts as a failure. Over the limit → HTTP 413 with a
+ * JSON-RPC -32600; blob transactions (~130 KB per blob) and large eth_call data fit.
+ */
+const maxRequestBodySize = '4mb';
+
+/**
  * Caller headers (lowercase) that are forwarded upstream. Everything else is dropped:
  * bg-rpc-proxy forwards headers to its fallback provider, so an X-Api-Key would leak;
  * a forwarded Content-Length/Transfer-Encoding no longer matches the re-serialized
@@ -123,6 +131,7 @@ export {
   ipRateLimitPerDay,
   rateLimitPollInterval,
   maxBatchLength,
+  maxRequestBodySize,
   forwardedHeaders,
   disabledMethods,
   getLogsMethods,

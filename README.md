@@ -47,7 +47,9 @@ Nothing sits in front of this service, so `trust proxy` is deliberately set to `
 
 ### 2. Validate JSON-RPC requests
 
-`utils/requestValidator.js` runs as global middleware and rejects malformed work before it can reach the main RPC machine. It handles both single requests and batch arrays, and checks that `jsonrpc` is `"2.0"` and that `method` and `id` are present.
+The body is parsed as JSON whatever the `Content-Type` says (so `curl -d` without a header and browser `fetch` with a string body both work), up to `maxRequestBodySize` in `config.js` (**4 MB**, the same as bg-rpc-proxy's limit, so an oversized body is refused here and never becomes a downstream failure). Body errors are answered as JSON-RPC, not HTML: over the limit → HTTP 413 with `-32600`, unparseable → HTTP 400 with `-32700`.
+
+`utils/requestValidator.js` then runs as global middleware and rejects malformed work before it can reach the main RPC machine. It handles both single requests and batch arrays, and checks that `jsonrpc` is `"2.0"` and that `method` and `id` are present. In a batch, each invalid item is answered on its own, at its position, with its own `id`; the valid items are processed normally and the answers are merged back in order (`utils/batchMerge.js`, shared with the disabled-method check). An empty batch, or one over 50 items, gets a single `-32600`.
 
 It also blocks dangerous namespaces outright:
 
@@ -57,7 +59,7 @@ admin_  personal_  debug_  miner_  engine_  clique_  les_
 
 These cover node management, wallet and key access, internal state dumps, mining control, and consensus-layer communication — none of which should be reachable from the public internet.
 
-Rejections return **HTTP 200** with a JSON-RPC error body: `-32700` for an empty or unparseable body, `-32600` for a structurally invalid request, `-32601` for a blocked namespace. If the validator itself throws, it fails **open** and lets the request through rather than taking the service down.
+Rejections return **HTTP 200** with a JSON-RPC error body: `-32700` for an empty body, `-32600` for a structurally invalid request, `-32601` for a blocked namespace (per item inside a batch). If the validator itself throws, it fails **open** and lets the request through rather than taking the service down.
 
 ### 3. Block blacklisted IPs
 
