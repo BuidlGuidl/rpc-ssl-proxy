@@ -90,6 +90,8 @@ Enforcement itself is a fast in-memory set lookup on every request. The blocklis
 
 ### 6. Forward upstream, with a circuit breaker
 
+TLS is verified on every outbound connection; nothing in the process turns verification off. The internal hops (bg-rpc-proxy on 48544, its `/getlogsStatus`, the getLogs forwarding path) share one agent, `utils/internalAgent.js`. Today the target presents a public Let's Encrypt certificate; if it ever presents a private one, set `TARGET_CA_FILE` to its PEM and that agent alone trusts it. The fallback provider has its own verifying agent, since its URL carries the API key.
+
 `utils/circuitBreaker.js` decides where each request goes:
 
 - **CLOSED** — normal, forward to `TARGET_URL` (the main RPC machine).

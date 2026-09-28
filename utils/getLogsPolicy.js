@@ -15,7 +15,7 @@
  */
 
 import axios from 'axios';
-import https from 'https';
+import { internalAgent } from './internalAgent.js';
 import {
   getLogsMaxBlockRange,
   getLogsMaxAddresses,
@@ -42,7 +42,6 @@ const state = {
   lastFloorError: null
 };
 
-const pollAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: true });
 
 function parseQuantity(value) {
   if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value;
@@ -56,7 +55,7 @@ async function pollHead(targetUrl) {
     const { data } = await axios.post(targetUrl, { jsonrpc: '2.0', id: 'edge-head', method: 'eth_blockNumber', params: [] }, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 5000,
-      httpsAgent: pollAgent
+      httpsAgent: internalAgent
     });
     const head = parseQuantity(data?.result);
     if (head === null) throw new Error(`unexpected eth_blockNumber result: ${JSON.stringify(data).slice(0, 200)}`);
@@ -71,7 +70,7 @@ async function pollHead(targetUrl) {
 
 async function pollFloor(statusUrl) {
   try {
-    const { data } = await axios.get(statusUrl, { timeout: 5000, httpsAgent: pollAgent });
+    const { data } = await axios.get(statusUrl, { timeout: 5000, httpsAgent: internalAgent });
     const floor = Number.isInteger(data?.receiptFloor) ? data.receiptFloor : null;
     state.readyNodes = Number.isInteger(data?.readyNodes) ? data.readyNodes : null;
     state.poolInFlight = Number.isInteger(data?.inFlight) ? data.inFlight : null;

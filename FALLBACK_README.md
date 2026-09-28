@@ -91,7 +91,7 @@ If the primary URL fails on a request, the system will:
 
 ### TLS/SSL Handling
 - Fallback requests use the same TLS settings as the main proxy
-- Self-signed certificates are allowed (rejectUnauthorized: false)
+- The provider's certificate is verified (its own `https.Agent`, `rejectUnauthorized: true`); the URL carries the API key, so an unverified connection would expose it
 - Longer timeout (15s) for fallback requests to handle slower connections
 
 ## Logging

@@ -24,11 +24,14 @@ import {
 import { redactUrl } from './utils/redactUrl.js';
 import { validateGetLogs, startGetLogsPollers, getGetLogsState } from './utils/getLogsPolicy.js';
 import { requestUnits } from './utils/requestUnits.js';
+import { spliceIntoBatchResponse } from './utils/batchMerge.js';
+import { internalAgent } from './utils/internalAgent.js';
 
 var app = express();
 https.globalAgent.options.ca = sslRootCas.create();
 dotenv.config();
-process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = 0;
+// TLS verification is on for the whole process. The internal hops use
+// utils/internalAgent.js (see TARGET_CA_FILE there), the fallback uses fallbackAgent.
 
 // Nothing sits in front of this service, so forwarding headers are caller-supplied
 // and unverifiable. Keeping this false makes req.ip the address observed on the socket.
@@ -163,10 +166,8 @@ function requestIdOf(body) {
   }
 }
 
-// The fallback is a public provider and its URL carries the API key, so its
-// certificate is verified. Explicit, because line ~31 sets NODE_TLS_REJECT_UNAUTHORIZED=0
-// for the process (the internal hops use self-signed certificates), which turns
-// verification off for every agent that doesn't say otherwise.
+// The fallback is a public provider and its URL carries the API key: its own agent,
+// verifying, never shared with the internal hops.
 const fallbackAgent = new https.Agent({ rejectUnauthorized: true });
 
 // Helper function to make fallback requests with consistent settings
@@ -198,6 +199,7 @@ let getLogsInFlight = 0;
 async function makeGetLogsRequest(data, headers) {
   return axios.post(targetUrl, data, {
     headers: upstreamHeaders(headers),
+    httpsAgent: internalAgent,
     timeout: getLogsUpstreamTimeoutMs,
     maxContentLength: getLogsMaxResponseBytes,
     maxBodyLength: getLogsMaxResponseBytes
@@ -218,6 +220,7 @@ async function makePrimaryRequest(method, url, data, headers, timeout = 15000) {
       method,
       url,
       headers: upstreamHeaders(headers),
+      httpsAgent: internalAgent,
       signal: controller.signal,
       timeout
     };
@@ -307,54 +310,80 @@ app.post("/", async (req, res) => {
   
   // ---- getLogs policy path (plan 4c/4d, policy pass) ----------------------------
   if (heavyItems.length > 0) {
-    // 1. validate every heavy item; the first failure answers the whole request.
-    // The resolved block count per item is kept for the unit count below.
+    // 1. validate every heavy item. A rejected item is answered per item (its -32602 /
+    // -32603 at its position, JSON-RPC batch semantics); the rest of the batch is
+    // forwarded and merged back in order (utils/batchMerge.js). Rejected items cost no
+    // rate-limiter units. The resolved block count per accepted item is kept for the
+    // unit count below.
+    const isBatch = Array.isArray(req.body);
     const heavyBlockCounts = new Map();
+    const rejected = []; // { index, response } relative to req.body as it is now
     for (const item of heavyItems) {
       const verdict = validateGetLogs(item);
-      heavyBlockCounts.set(item, verdict.blockCount);
-      if (!verdict.ok) {
-        console.log(`🪵 getLogs rejected (${item.method}) from ${clientIP}: ${verdict.error.code} ${verdict.error.message}`);
-        res.status(200).json(jsonRpcError(item.id, verdict.error.code, verdict.error.message));
+      if (verdict.ok) {
+        heavyBlockCounts.set(item, verdict.blockCount);
+        continue;
+      }
+      console.log(`🪵 getLogs rejected (${item.method}) from ${clientIP}: ${verdict.error.code} ${verdict.error.message}`);
+      rejected.push({
+        index: isBatch ? req.body.indexOf(item) : 0,
+        response: jsonRpcError(item.id, verdict.error.code, verdict.error.message)
+      });
+    }
+
+    if (rejected.length > 0) {
+      if (!isBatch) {
+        res.status(200).json(rejected[0].response);
         return;
       }
+      const remaining = req.body.filter(item => !rejected.some(r => req.body[r.index] === item));
+      if (remaining.length === 0) {
+        res.status(200).json(rejected.map(r => r.response));
+        return;
+      }
+      req.body = remaining;
+      spliceIntoBatchResponse(res, rejected);
     }
 
-    // 2. edge-wide capacity
-    if (getLogsInFlight >= getLogsGlobalConcurrency) {
-      console.log(`🪵 getLogs capacity: ${getLogsInFlight} in flight, rejecting request from ${clientIP}`);
-      res.status(429)
-        .set('Retry-After', '2')
-        .json(jsonRpcError(requestIdOf(req.body), -32005, 'getLogs capacity exhausted at the edge, retry shortly'));
+    // No accepted getLogs item left: the rest of the batch takes the normal path below.
+    if (heavyBlockCounts.size > 0) {
+      // 2. edge-wide capacity
+      if (getLogsInFlight >= getLogsGlobalConcurrency) {
+        console.log(`🪵 getLogs capacity: ${getLogsInFlight} in flight, rejecting request from ${clientIP}`);
+        res.status(429)
+          .set('Retry-After', '2')
+          .json(jsonRpcError(requestIdOf(req.body), -32005, 'getLogs capacity exhausted at the edge, retry shortly'));
+        return;
+      }
+
+      // 3. forward: own timeout, size cap, no breaker, no fallback
+      const served = [...heavyBlockCounts.keys()].map(r => r.method).join(',');
+      getLogsInFlight++;
+      const startedAt = Date.now();
+      try {
+        const response = await makeGetLogsRequest(req.body, req.headers);
+        res.status(200).send(response.data);
+        console.log(`🪵 getLogs served (${served}) from ${clientIP} in ${Date.now() - startedAt} ms, upstream ${response.headers?.['content-length'] ?? '?'} bytes`);
+      } catch (error) {
+        const tooLarge = /maxContentLength|maxBodyLength/i.test(error.message || '');
+        console.log(`🪵 getLogs upstream error after ${Date.now() - startedAt} ms: ${error.code || 'no code'} ${error.message}`);
+        res.status(200).json(jsonRpcError(
+          requestIdOf(req.body),
+          -32603,
+          tooLarge ? 'Internal error: response too large' : 'Internal error: upstream request failed'
+        ));
+      } finally {
+        getLogsInFlight--;
+      }
+
+      // Count the forwarded items toward the IP/origin limiter like any other served
+      // request (shared cost table; getLogs items use the block count from validation).
+      const requests = Array.isArray(req.body) ? req.body : [req.body];
+      const requestCount = requests.reduce((sum, r) => sum + requestUnits(r, heavyBlockCounts.get(r)), 0);
+      updateIpCountMap(clientIP, req.headers.origin, requestCount);
+      if (req.headers.origin) updateUrlCountMap(req.headers.origin, requestCount);
       return;
     }
-
-    // 3. forward: own timeout, size cap, no breaker, no fallback
-    getLogsInFlight++;
-    const startedAt = Date.now();
-    try {
-      const response = await makeGetLogsRequest(req.body, req.headers);
-      res.status(200).send(response.data);
-      console.log(`🪵 getLogs served (${heavyItems.map(r => r.method).join(',')}) from ${clientIP} in ${Date.now() - startedAt} ms, upstream ${response.headers?.['content-length'] ?? '?'} bytes`);
-    } catch (error) {
-      const tooLarge = /maxContentLength|maxBodyLength/i.test(error.message || '');
-      console.log(`🪵 getLogs upstream error after ${Date.now() - startedAt} ms: ${error.code || 'no code'} ${error.message}`);
-      res.status(200).json(jsonRpcError(
-        requestIdOf(req.body),
-        -32603,
-        tooLarge ? 'Internal error: response too large' : 'Internal error: upstream request failed'
-      ));
-    } finally {
-      getLogsInFlight--;
-    }
-
-    // Count toward the IP/origin limiter like any other served request (weighted by
-    // the shared cost table; getLogs items use the block count from validation).
-    const requests = Array.isArray(req.body) ? req.body : [req.body];
-    const requestCount = requests.reduce((sum, r) => sum + requestUnits(r, heavyBlockCounts.get(r)), 0);
-    updateIpCountMap(clientIP, req.headers.origin, requestCount);
-    if (req.headers.origin) updateUrlCountMap(req.headers.origin, requestCount);
-    return;
   }
   // ---- end getLogs policy path ---------------------------------------------------
 
@@ -525,6 +554,7 @@ app.get("/", async (req, res) => {
       // Use a simple axios call for GET requests (no circuit breaker)
       const response = await axios.get(targetUrl, {
         headers: upstreamHeaders(req.headers),
+        httpsAgent: internalAgent,
         timeout: 10000
       });
       console.log("GET RESPONSE", response.data);
