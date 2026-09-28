@@ -18,11 +18,12 @@ import { rejectDisabledMethods } from './utils/disabledMethods.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
 import {
-  defaultRequestCount, methodRequestCounts, forwardedHeaders,
+  forwardedHeaders,
   getLogsMethods, getLogsGlobalConcurrency, getLogsUpstreamTimeoutMs, getLogsMaxResponseBytes
 } from './config.js';
 import { redactUrl } from './utils/redactUrl.js';
 import { validateGetLogs, startGetLogsPollers, getGetLogsState } from './utils/getLogsPolicy.js';
+import { requestUnits } from './utils/requestUnits.js';
 
 var app = express();
 https.globalAgent.options.ca = sslRootCas.create();
@@ -297,9 +298,12 @@ app.post("/", async (req, res) => {
   
   // ---- getLogs policy path (plan 4c/4d, policy pass) ----------------------------
   if (heavyItems.length > 0) {
-    // 1. validate every heavy item; the first failure answers the whole request
+    // 1. validate every heavy item; the first failure answers the whole request.
+    // The resolved block count per item is kept for the unit count below.
+    const heavyBlockCounts = new Map();
     for (const item of heavyItems) {
       const verdict = validateGetLogs(item);
+      heavyBlockCounts.set(item, verdict.blockCount);
       if (!verdict.ok) {
         console.log(`🪵 getLogs rejected (${item.method}) from ${clientIP}: ${verdict.error.code} ${verdict.error.message}`);
         res.status(200).json(jsonRpcError(item.id, verdict.error.code, verdict.error.message));
@@ -335,9 +339,10 @@ app.post("/", async (req, res) => {
       getLogsInFlight--;
     }
 
-    // Count toward the IP/origin limiter like any other served request (weighted).
+    // Count toward the IP/origin limiter like any other served request (weighted by
+    // the shared cost table; getLogs items use the block count from validation).
     const requests = Array.isArray(req.body) ? req.body : [req.body];
-    const requestCount = requests.reduce((sum, r) => sum + (methodRequestCounts[r?.method] ?? defaultRequestCount), 0);
+    const requestCount = requests.reduce((sum, r) => sum + requestUnits(r, heavyBlockCounts.get(r)), 0);
     updateIpCountMap(clientIP, req.headers.origin, requestCount);
     if (req.headers.origin) updateUrlCountMap(req.headers.origin, requestCount);
     return;
@@ -434,13 +439,10 @@ app.post("/", async (req, res) => {
 
   // Only count requests in Firebase if we successfully used primary URL (not fallback)
   if (!actuallyUsedFallback && responseData && req.headers) {
-    // Weighted request count for rate limiting (heavy methods count for more)
+    // Weighted request count for rate limiting (shared cost table; heavy methods
+    // count for more). getLogs never reaches this path, so no block count is needed.
     const requests = Array.isArray(req.body) ? req.body : [req.body];
-    const requestCount = requests.reduce((sum, r) => {
-      if (!r || typeof r.method !== 'string') return sum + defaultRequestCount;
-      const weight = methodRequestCounts[r.method] ?? defaultRequestCount;
-      return sum + weight;
-    }, 0);
+    const requestCount = requests.reduce((sum, r) => sum + requestUnits(r), 0);
     if (requests.length > 1 || requestCount !== requests.length) {
       console.log(`Request count: ${requests.length} call(s) → ${requestCount} weighted unit(s)`);
     }

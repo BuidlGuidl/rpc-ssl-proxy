@@ -82,7 +82,7 @@ Hard-blocked for every caller. Log range scans are expensive enough to degrade t
 | Origin (deployed app) | 4,000 | 40,000 |
 | IP (no origin) | 1,000 | 5,000 |
 
-**Weights.** Limits are denominated in weighted units, not raw calls. `eth_getLogs` counts as 100, `eth_getBlockByNumber` and `eth_getBlockByHash` count as 2, everything else counts as 1. See `methodRequestCounts` in `config.js`.
+**Weights.** Limits are denominated in weighted units, not raw calls, using the shared request cost table in `utils/requestUnits.js` (the same units the RPC pool uses for load balancing and API-key metering will use): `eth_getLogs` counts 1 + ⌈blocks / 1000⌉ (2 for up to 1,000 blocks, 11 for the 10,000 cap; a `blockHash` filter is 1 block), `eth_getBlockReceipts`, `eth_getBlockByNumber` and `eth_getBlockByHash` count 2, `eth_feeHistory` counts 1 + ⌈blockCount / 100⌉ (capped at 1,024 blocks), `eth_getProof` counts 1 + ⌈storageKeys / 10⌉, everything else counts 1, and a batch counts the sum of its items.
 
 Enforcement itself is a fast in-memory set lookup on every request. The blocklists behind it are refreshed from Postgres every 10 seconds by a background poll. Limited callers get a 429 with JSON-RPC error `-32005` and a `Retry-After` header. The check fails open.
 

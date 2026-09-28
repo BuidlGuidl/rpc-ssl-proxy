@@ -43,25 +43,11 @@ const rateLimitPollInterval = 10;   // How often to poll DB for rate limit data 
 // =============================================================================
 // REQUEST COUNT WEIGHTS (for rate limiting)
 // =============================================================================
-// Each request can count as more than 1 toward rate limits. Heavier methods
-// use more provider resources and count for more. Limits in config above are
-// in "weighted request units" (e.g. 4000/hour = 4000 units, not 4000 calls).
+// Each request counts for one or more "units" toward the limits above (e.g.
+// 4000/hour = 4000 units, not 4000 calls). The units come from the shared request
+// cost table in utils/requestUnits.js (requestUnits()), which the RPC pool also
+// uses for load balancing and API-key metering will use; the numbers must match.
 // =============================================================================
-
-/** Default count per request when method is not listed in methodRequestCounts */
-const defaultRequestCount = 1;
-
-/**
- * Map of JSON-RPC method name -> request count (weight) for rate limiting.
- * Only list methods that should count for more than defaultRequestCount.
- */
-const methodRequestCounts = {
-  // Heavy log/block range queries
-  eth_getLogs: 100,
-  // Full block with transactions
-  eth_getBlockByNumber: 2,
-  eth_getBlockByHash: 2,
-};
 
 // =============================================================================
 // EDGE HYGIENE (bg-rpc-docs plan, Phase 1d)
@@ -136,8 +122,6 @@ export {
   originRateLimitPerDay,
   ipRateLimitPerDay,
   rateLimitPollInterval,
-  defaultRequestCount,
-  methodRequestCounts,
   maxBatchLength,
   forwardedHeaders,
   disabledMethods,
