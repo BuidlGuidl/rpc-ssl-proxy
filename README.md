@@ -92,6 +92,8 @@ Enforcement itself is a fast in-memory set lookup on every request. The blocklis
 
 TLS is verified on every outbound connection; nothing in the process turns verification off. The internal hops (bg-rpc-proxy on 48544, its `/getlogsStatus`, the getLogs forwarding path) share one agent, `utils/internalAgent.js`. Today the target presents a public Let's Encrypt certificate; if it ever presents a private one, set `TARGET_CA_FILE` to its PEM and that agent alone trusts it. The fallback provider has its own verifying agent, since its URL carries the API key.
 
+Only two caller headers cross to the next hop, `user-agent` and `origin` (`forwardedHeaders` in `config.js`); everything else, including any `X-Client-IP` a caller sends, is dropped. On requests to bg-rpc-proxy the edge adds its own `X-Client-IP` with the caller's socket address (the same value the rate limiter keys on), so the downstream request logs can record who asked. It is never sent to the fallback provider, and the edge's own head and floor polls carry no client IP.
+
 `utils/circuitBreaker.js` decides where each request goes:
 
 - **CLOSED** — normal, forward to `TARGET_URL` (the main RPC machine).

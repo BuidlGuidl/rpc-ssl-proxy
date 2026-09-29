@@ -143,14 +143,21 @@ function getOrigin(req) {
 
 // Build the header set for the next hop. Only the allowlisted caller headers cross
 // (see forwardedHeaders in config.js); Content-Type is always ours because the body
-// is re-serialized from req.body.
-function upstreamHeaders(clientHeaders) {
+// is re-serialized from req.body. When clientIP is given (requests to TARGET_URL,
+// bg-rpc-proxy, which logs it), X-Client-IP carries the caller's socket address as
+// seen by this edge: the same value the rate limiter uses (getClientIP). A caller's
+// own X-Client-IP is never forwarded (it isn't in the allowlist). Calls without
+// clientIP (the fallback provider) never get the header.
+function upstreamHeaders(clientHeaders, clientIP) {
   const headers = { "Content-Type": "application/json" };
   for (const name of forwardedHeaders) {
     const value = clientHeaders?.[name];
     if (typeof value === 'string' && value !== '') {
       headers[name] = value;
     }
+  }
+  if (typeof clientIP === 'string' && clientIP !== '') {
+    headers["X-Client-IP"] = clientIP;
   }
   return headers;
 }
@@ -196,9 +203,9 @@ let getLogsInFlight = 0;
 // makePrimaryRequest: its own (longer) timeout, a response size cap, and it never
 // touches the circuit breaker or the fallback: a getLogs failure is returned to the
 // caller as JSON-RPC, never retried on a paid provider (plan 4c step 5).
-async function makeGetLogsRequest(data, headers) {
+async function makeGetLogsRequest(data, headers, clientIP) {
   return axios.post(targetUrl, data, {
-    headers: upstreamHeaders(headers),
+    headers: upstreamHeaders(headers, clientIP),
     httpsAgent: internalAgent,
     timeout: getLogsUpstreamTimeoutMs,
     maxContentLength: getLogsMaxResponseBytes,
@@ -211,7 +218,7 @@ function jsonRpcError(id, code, message) {
 }
 
 // Helper function to make primary requests with circuit breaker
-async function makePrimaryRequest(method, url, data, headers, timeout = 15000) {
+async function makePrimaryRequest(method, url, data, headers, clientIP, timeout = 15000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   
@@ -219,7 +226,7 @@ async function makePrimaryRequest(method, url, data, headers, timeout = 15000) {
     const config = {
       method,
       url,
-      headers: upstreamHeaders(headers),
+      headers: upstreamHeaders(headers, clientIP),
       httpsAgent: internalAgent,
       signal: controller.signal,
       timeout
@@ -361,7 +368,7 @@ app.post("/", async (req, res) => {
       getLogsInFlight++;
       const startedAt = Date.now();
       try {
-        const response = await makeGetLogsRequest(req.body, req.headers);
+        const response = await makeGetLogsRequest(req.body, req.headers, clientIP);
         res.status(200).send(response.data);
         console.log(`🪵 getLogs served (${served}) from ${clientIP} in ${Date.now() - startedAt} ms, upstream ${response.headers?.['content-length'] ?? '?'} bytes`);
       } catch (error) {
@@ -434,7 +441,7 @@ app.post("/", async (req, res) => {
     } else {
       // Try primary first
       try {
-        response = await makePrimaryRequest('post', currentUrl, req.body, req.headers);
+        response = await makePrimaryRequest('post', currentUrl, req.body, req.headers, getClientIP(req));
         // Don't delete this
         // console.log("POST RESPONSE", response.data, "(PRIMARY)");
       } catch (primaryError) {
@@ -553,7 +560,7 @@ app.get("/", async (req, res) => {
     try {
       // Use a simple axios call for GET requests (no circuit breaker)
       const response = await axios.get(targetUrl, {
-        headers: upstreamHeaders(req.headers),
+        headers: upstreamHeaders(req.headers, getClientIP(req)),
         httpsAgent: internalAgent,
         timeout: 10000
       });
@@ -567,7 +574,7 @@ app.get("/", async (req, res) => {
         try {
           console.log("🔄 Trying GET with fallback URL...");
           const fallbackResponse = await axios.get(fallbackUrl, {
-            headers: upstreamHeaders(req.headers),
+            headers: upstreamHeaders(req.headers), // no client IP to the fallback provider
             timeout: 10000,
             httpsAgent: fallbackAgent
           });
