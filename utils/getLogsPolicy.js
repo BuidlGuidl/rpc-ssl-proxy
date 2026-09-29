@@ -23,7 +23,8 @@ import {
   getLogsHeadPollInterval,
   getLogsFloorPollInterval,
   getLogsHeadMaxAge,
-  getLogsFloorMaxAge
+  getLogsFloorMaxAge,
+  internalRequestOrigin
 } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -53,7 +54,7 @@ function parseQuantity(value) {
 async function pollHead(targetUrl) {
   try {
     const { data } = await axios.post(targetUrl, { jsonrpc: '2.0', id: 'edge-head', method: 'eth_blockNumber', params: [] }, {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Origin: internalRequestOrigin },
       timeout: 5000,
       httpsAgent: internalAgent
     });
@@ -70,7 +71,7 @@ async function pollHead(targetUrl) {
 
 async function pollFloor(statusUrl) {
   try {
-    const { data } = await axios.get(statusUrl, { timeout: 5000, httpsAgent: internalAgent });
+    const { data } = await axios.get(statusUrl, { headers: { Origin: internalRequestOrigin }, timeout: 5000, httpsAgent: internalAgent });
     const floor = Number.isInteger(data?.receiptFloor) ? data.receiptFloor : null;
     state.readyNodes = Number.isInteger(data?.readyNodes) ? data.readyNodes : null;
     state.poolInFlight = Number.isInteger(data?.inFlight) ? data.inFlight : null;

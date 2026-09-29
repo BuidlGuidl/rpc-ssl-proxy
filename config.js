@@ -116,6 +116,9 @@ const getLogsMaxResponseBytes = 20e6;
 const getLogsHeadPollInterval = 12;
 const getLogsFloorPollInterval = 60;
 
+/** Origin sent on the edge's own polls to bg-rpc-proxy (head, floor): the same Origin the buidlguidl clients send, so downstream stats treat them as internal traffic. */
+const internalRequestOrigin = 'buidlguidl-client';
+
 /** A head or floor older than this is treated as unknown (getLogs fails closed). Seconds. */
 const getLogsHeadMaxAge = 120;
 const getLogsFloorMaxAge = 600;
@@ -144,5 +147,6 @@ export {
   getLogsHeadPollInterval,
   getLogsFloorPollInterval,
   getLogsHeadMaxAge,
-  getLogsFloorMaxAge
+  getLogsFloorMaxAge,
+  internalRequestOrigin
 };
