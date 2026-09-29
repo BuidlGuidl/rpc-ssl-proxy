@@ -110,11 +110,17 @@ function itemProblem(request, exemptOrigin) {
   const method = request?.method;
   const id = request?.id;
 
-  if (!jsonrpc || jsonrpc !== "2.0" || !method || id === undefined) {
+  // method must be a non-empty string: every later check compares it by name
+  // (namespaces, disabled methods, the getLogs policy, request units, the exempt
+  // origin rule), and a non-string such as ["eth_getLogs"] would slip past them all.
+  const methodMissing = method === undefined || method === null;
+  const methodBad = !methodMissing && (typeof method !== 'string' || method === '');
+  if (!jsonrpc || jsonrpc !== "2.0" || methodMissing || methodBad || id === undefined) {
     const reason = [];
     if (!jsonrpc) reason.push('jsonrpc missing');
     else if (jsonrpc !== "2.0") reason.push('jsonrpc must be "2.0"');
-    if (!method) reason.push('method missing');
+    if (methodMissing) reason.push('method missing');
+    else if (methodBad) reason.push('method must be a string');
     if (id === undefined) reason.push('id missing');
     const reasonStr = reason.join(", ");
     return { code: -32600, message: `Invalid Request: ${reasonStr}`, reason: reasonStr };

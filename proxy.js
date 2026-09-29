@@ -19,7 +19,7 @@ import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './u
 import { requireAdminKey } from './utils/adminAuth.js';
 import {
   forwardedHeaders, maxRequestBodySize,
-  getLogsMethods, getLogsGlobalConcurrency, getLogsUpstreamTimeoutMs, getLogsMaxResponseBytes
+  getLogsMethods, getLogsGlobalConcurrency, getLogsMaxPerBatch, getLogsUpstreamTimeoutMs, getLogsMaxResponseBytes
 } from './config.js';
 import { redactUrl } from './utils/redactUrl.js';
 import { validateGetLogs, startGetLogsPollers, getGetLogsState } from './utils/getLogsPolicy.js';
@@ -213,6 +213,24 @@ async function makeGetLogsRequest(data, headers, clientIP) {
   });
 }
 
+// Forward one getLogs-path item (or the non-getLogs remainder of a batch) and turn
+// the outcome into an answer: the upstream body, or a -32603 with the given id.
+async function forwardGetLogsPath(data, headers, clientIP, errorId) {
+  const startedAt = Date.now();
+  try {
+    const response = await makeGetLogsRequest(data, headers, clientIP);
+    return { ok: true, data: response.data, ms: Date.now() - startedAt, bytes: response.headers?.['content-length'] ?? '?' };
+  } catch (error) {
+    const tooLarge = /maxContentLength|maxBodyLength/i.test(error.message || '');
+    console.log(`🪵 getLogs upstream error after ${Date.now() - startedAt} ms: ${error.code || 'no code'} ${error.message}`);
+    return {
+      ok: false,
+      ms: Date.now() - startedAt,
+      data: jsonRpcError(errorId, -32603, tooLarge ? 'Internal error: response too large' : 'Internal error: upstream request failed')
+    };
+  }
+}
+
 function jsonRpcError(id, code, message) {
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
 }
@@ -320,12 +338,22 @@ app.post("/", async (req, res) => {
     // 1. validate every heavy item. A rejected item is answered per item (its -32602 /
     // -32603 at its position, JSON-RPC batch semantics); the rest of the batch is
     // forwarded and merged back in order (utils/batchMerge.js). Rejected items cost no
-    // rate-limiter units. The resolved block count per accepted item is kept for the
-    // unit count below.
+    // rate-limiter units and no in-flight slot. At most getLogsMaxPerBatch eth_getLogs
+    // items per batch: the ones past the cap are rejected before validation. The
+    // resolved block count per accepted item is kept for the unit count below.
     const isBatch = Array.isArray(req.body);
     const heavyBlockCounts = new Map();
     const rejected = []; // { index, response } relative to req.body as it is now
+    let getLogsSeen = 0;
     for (const item of heavyItems) {
+      if (item.method === 'eth_getLogs' && ++getLogsSeen > getLogsMaxPerBatch) {
+        console.log(`🪵 getLogs rejected (batch cap) from ${clientIP}: item ${getLogsSeen} of ${heavyItems.length}`);
+        rejected.push({
+          index: req.body.indexOf(item),
+          response: jsonRpcError(item.id, -32602, `At most ${getLogsMaxPerBatch} eth_getLogs per batch; send the rest in another request`)
+        });
+        continue;
+      }
       const verdict = validateGetLogs(item);
       if (verdict.ok) {
         heavyBlockCounts.set(item, verdict.blockCount);
@@ -354,41 +382,87 @@ app.post("/", async (req, res) => {
 
     // No accepted getLogs item left: the rest of the batch takes the normal path below.
     if (heavyBlockCounts.size > 0) {
-      // 2. edge-wide capacity
-      if (getLogsInFlight >= getLogsGlobalConcurrency) {
-        console.log(`🪵 getLogs capacity: ${getLogsInFlight} in flight, rejecting request from ${clientIP}`);
+      // 2. edge-wide capacity: one slot per accepted getLogs item, all or nothing
+      const slots = heavyBlockCounts.size;
+      if (getLogsInFlight + slots > getLogsGlobalConcurrency) {
+        console.log(`🪵 getLogs capacity: ${getLogsInFlight} in flight + ${slots} requested > ${getLogsGlobalConcurrency}, rejecting request from ${clientIP}`);
         res.status(429)
           .set('Retry-After', '2')
           .json(jsonRpcError(requestIdOf(req.body), -32005, 'getLogs capacity exhausted at the edge, retry shortly'));
         return;
       }
 
-      // 3. forward: own timeout, size cap, no breaker, no fallback
-      const served = [...heavyBlockCounts.keys()].map(r => r.method).join(',');
-      getLogsInFlight++;
-      const startedAt = Date.now();
-      try {
-        const response = await makeGetLogsRequest(req.body, req.headers, clientIP);
-        res.status(200).send(response.data);
-        console.log(`🪵 getLogs served (${served}) from ${clientIP} in ${Date.now() - startedAt} ms, upstream ${response.headers?.['content-length'] ?? '?'} bytes`);
-      } catch (error) {
-        const tooLarge = /maxContentLength|maxBodyLength/i.test(error.message || '');
-        console.log(`🪵 getLogs upstream error after ${Date.now() - startedAt} ms: ${error.code || 'no code'} ${error.message}`);
-        res.status(200).json(jsonRpcError(
-          requestIdOf(req.body),
-          -32603,
-          tooLarge ? 'Internal error: response too large' : 'Internal error: upstream request failed'
-        ));
-      } finally {
-        getLogsInFlight--;
+      // 3. forward: own timeout, size cap, no breaker, no fallback.
+      if (!isBatch) {
+        // Single request: one slot, one upstream request, the answer as-is.
+        getLogsInFlight++;
+        let outcome;
+        try {
+          outcome = await forwardGetLogsPath(req.body, req.headers, clientIP, requestIdOf(req.body));
+        } finally {
+          getLogsInFlight--;
+        }
+        res.status(200).send(outcome.data);
+        if (outcome.ok) {
+          console.log(`🪵 getLogs served (${req.body.method}) from ${clientIP} in ${outcome.ms} ms, upstream ${outcome.bytes} bytes`);
+          const requestCount = requestUnits(req.body, heavyBlockCounts.get(req.body));
+          updateIpCountMap(clientIP, req.headers.origin, requestCount);
+          if (req.headers.origin) updateUrlCountMap(req.headers.origin, requestCount);
+        }
+        return;
       }
 
-      // Count the forwarded items toward the IP/origin limiter like any other served
-      // request (shared cost table; getLogs items use the block count from validation).
-      const requests = Array.isArray(req.body) ? req.body : [req.body];
-      const requestCount = requests.reduce((sum, r) => sum + requestUnits(r, heavyBlockCounts.get(r)), 0);
-      updateIpCountMap(clientIP, req.headers.origin, requestCount);
-      if (req.headers.origin) updateUrlCountMap(req.headers.origin, requestCount);
+      // Batch: each accepted getLogs item goes upstream as its own request, in
+      // parallel (bg-rpc-proxy would run a batch's items one after another, so one
+      // batch could outlast every timeout); the non-getLogs items go as one batch.
+      // Answers are merged back in the batch's order; a failed item gets its own
+      // -32603 and the others keep their answers.
+      const items = req.body;
+      const answers = new Array(items.length);
+      const restIndexes = [];
+      items.forEach((item, i) => { if (!heavyBlockCounts.has(item)) restIndexes.push(i); });
+      getLogsInFlight += slots;
+      const startedAt = Date.now();
+      let servedUnits = 0;
+      const jobs = [];
+      items.forEach((item, i) => {
+        if (!heavyBlockCounts.has(item)) return;
+        jobs.push(forwardGetLogsPath(item, req.headers, clientIP, item?.id ?? null).then(outcome => {
+          answers[i] = outcome.data;
+          if (outcome.ok) servedUnits += requestUnits(item, heavyBlockCounts.get(item));
+          console.log(`🪵 getLogs batch item ${i} ${outcome.ok ? 'served' : 'failed'} from ${clientIP} in ${outcome.ms} ms, upstream ${outcome.bytes ?? '-'} bytes`);
+        }).finally(() => { getLogsInFlight--; }));
+      });
+      if (restIndexes.length > 0) {
+        const rest = restIndexes.map(i => items[i]);
+        jobs.push(forwardGetLogsPath(rest, req.headers, clientIP, null).then(outcome => {
+          const byPosition = outcome.ok && Array.isArray(outcome.data) && outcome.data.length === rest.length;
+          const byId = outcome.ok && Array.isArray(outcome.data) ? new Map(outcome.data.map(a => [a?.id, a])) : null;
+          restIndexes.forEach((i, k) => {
+            const item = items[i];
+            let answer;
+            if (byPosition) answer = outcome.data[k];
+            else if (byId && item?.id !== undefined && byId.has(item.id)) answer = byId.get(item.id);
+            if (answer === undefined) {
+              answer = jsonRpcError(item?.id ?? null, -32603, 'Internal error: upstream request failed');
+            } else {
+              servedUnits += requestUnits(item);
+            }
+            answers[i] = answer;
+          });
+        }));
+      }
+      await Promise.all(jobs);
+      res.status(200).json(answers);
+      const failed = answers.filter(a => a?.error?.code === -32603).length;
+      console.log(`🪵 getLogs batch from ${clientIP}: ${slots} getLogs + ${restIndexes.length} other item(s), ${failed} failed, ${Date.now() - startedAt} ms`);
+
+      // Count only what was served toward the IP/origin limiter (shared cost table;
+      // getLogs items by their block count).
+      if (servedUnits > 0) {
+        updateIpCountMap(clientIP, req.headers.origin, servedUnits);
+        if (req.headers.origin) updateUrlCountMap(req.headers.origin, servedUnits);
+      }
       return;
     }
   }

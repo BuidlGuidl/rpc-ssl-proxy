@@ -103,6 +103,14 @@ const getLogsMaxBlockRange = 10000;
 const getLogsMaxAddresses = 10;
 const getLogsMaxTopics = 4;
 
+/**
+ * Max eth_getLogs items in one batch. bg-rpc-proxy runs batch items one after another,
+ * so a batch of many getLogs outlasts every timeout while the nodes keep working. The
+ * edge sends each accepted getLogs item upstream as its own request, in parallel, each
+ * taking one in-flight slot; items past this cap get -32602 at their position.
+ */
+const getLogsMaxPerBatch = 5;
+
 /** Edge-wide in-flight cap for getLogs-path requests (D8). Over this → -32005, HTTP 429. */
 const getLogsGlobalConcurrency = 16;
 
@@ -158,6 +166,7 @@ export {
   getLogsMaxAddresses,
   getLogsMaxTopics,
   getLogsGlobalConcurrency,
+  getLogsMaxPerBatch,
   getLogsUpstreamTimeoutMs,
   getLogsMaxResponseBytes,
   getLogsHeadPollInterval,
