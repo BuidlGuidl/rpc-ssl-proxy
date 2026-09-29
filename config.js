@@ -116,6 +116,22 @@ const getLogsMaxResponseBytes = 20e6;
 const getLogsHeadPollInterval = 12;
 const getLogsFloorPollInterval = 60;
 
+/**
+ * What a request carrying the rate-limit-exempt origin (rateLimiter EXEMPT_ORIGINS,
+ * 'buidlguidl-client') may call. Origin is a caller-set header, so the exemption is
+ * available to anyone who copies it; it is therefore held to the two calls the
+ * buidlguidl clients actually make (checked in the client code and the stage logs):
+ * eth_blockNumber for the dashboard head, and eth_call to the ENS Universal Resolver
+ * (viem getEnsAddress, for owner ENS names). Anything else with that origin gets
+ * -32601 "Method not supported from this origin" before rate limiting or forwarding.
+ */
+const exemptOriginMethods = ['eth_blockNumber', 'eth_call'];
+/** eth_call targets allowed from an exempt origin (lowercase). No state-override param. */
+const exemptOriginCallTargets = [
+  '0xce01f8eee7e479c928f8919abd53e553a36cef67', // ENS Universal Resolver, viem <= 2.31.x (what clients run)
+  '0xeeeeeeee14d718c2b47d9923deab1335e144eeee'  // ENS Universal Resolver, current viem (client upgrades)
+];
+
 /** Origin sent on the edge's own polls to bg-rpc-proxy (head, floor): the same Origin the buidlguidl clients send, so downstream stats treat them as internal traffic. */
 const internalRequestOrigin = 'buidlguidl-client';
 
@@ -148,5 +164,7 @@ export {
   getLogsFloorPollInterval,
   getLogsHeadMaxAge,
   getLogsFloorMaxAge,
-  internalRequestOrigin
+  internalRequestOrigin,
+  exemptOriginMethods,
+  exemptOriginCallTargets
 };

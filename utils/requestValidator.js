@@ -12,7 +12,8 @@
 
 import { logRejectedRequest } from './rejectLogger.js';
 import { spliceIntoBatchResponse } from './batchMerge.js';
-import { maxBatchLength, maxRequestBodySize } from '../config.js';
+import { maxBatchLength, maxRequestBodySize, exemptOriginMethods, exemptOriginCallTargets } from '../config.js';
+import { isExemptOrigin } from './rateLimiter.js';
 
 /**
  * Blocked RPC namespaces - these are dangerous or sensitive methods that should not be exposed
@@ -78,11 +79,33 @@ function sendErrorAndLog(req, res, code, message, id, logReason) {
   });
 }
 
+const exemptMethodSet = new Set(exemptOriginMethods);
+const exemptCallTargetSet = new Set(exemptOriginCallTargets.map(a => a.toLowerCase()));
+const EXEMPT_ORIGIN_MESSAGE = 'Method not supported from this origin';
+
+/**
+ * Is this call one the exempt origin is permitted to make? (config.js:
+ * exemptOriginMethods / exemptOriginCallTargets.) eth_call must target one of the
+ * listed addresses and carry no third (state override) param.
+ */
+function allowedFromExemptOrigin(request) {
+  const method = request.method;
+  if (!exemptMethodSet.has(method)) return false;
+  if (method !== 'eth_call') return true;
+  const params = request.params;
+  if (!Array.isArray(params) || params.length > 2) return false;
+  const call = params[0];
+  if (!call || typeof call !== 'object' || Array.isArray(call)) return false;
+  return typeof call.to === 'string' && exemptCallTargetSet.has(call.to.toLowerCase());
+}
+
 /**
  * Why one JSON-RPC item is unacceptable, or null if it's fine.
+ * @param {object} request - one JSON-RPC item
+ * @param {boolean} exemptOrigin - the request carries a rate-limit-exempt origin
  * @returns {{ code: number, message: string, reason: string, namespace?: string } | null}
  */
-function itemProblem(request) {
+function itemProblem(request, exemptOrigin) {
   const jsonrpc = request?.jsonrpc;
   const method = request?.method;
   const id = request?.id;
@@ -104,6 +127,16 @@ function itemProblem(request) {
       message: `Method not supported: The '${blockedNamespace}' namespace is not available on this endpoint`,
       reason: `blocked namespace '${blockedNamespace}' (method: ${method})`,
       namespace: blockedNamespace
+    };
+  }
+
+  // A rate-limit-exempt origin is held to the calls the buidlguidl clients make.
+  if (exemptOrigin && !allowedFromExemptOrigin(request)) {
+    return {
+      code: -32601,
+      message: EXEMPT_ORIGIN_MESSAGE,
+      reason: `exempt origin not allowed to call ${method}` + (method === 'eth_call' ? ` (to: ${request?.params?.[0]?.to ?? 'none'})` : ''),
+      exemptOrigin: true
     };
   }
   return null;
@@ -166,6 +199,10 @@ function validateRpcRequest(req, res, next) {
       );
     }
 
+    // A request whose Origin is rate-limit exempt (normalized like the limiter does)
+    // is held to the calls the buidlguidl clients make; see itemProblem().
+    const exemptOrigin = isExemptOrigin(req.headers?.origin);
+
     // Handle batch requests (arrays)
     if (Array.isArray(req.body)) {
       if (req.body.length === 0) {
@@ -199,12 +236,14 @@ function validateRpcRequest(req, res, next) {
       const reasons = [];
       for (let i = 0; i < req.body.length; i++) {
         const request = req.body[i];
-        const problem = itemProblem(request);
+        const problem = itemProblem(request, exemptOrigin);
         if (!problem) {
           remaining.push(request);
           continue;
         }
-        if (problem.code === -32601) {
+        if (problem.exemptOrigin) {
+          console.log(`🚫 Exempt origin ${req.headers.origin} in batch item ${i}: ${problem.reason}`);
+        } else if (problem.code === -32601) {
           console.log(`🚫 Blocked namespace in batch item ${i}: ${problem.namespace} (method: ${request.method})`);
         } else {
           console.log(`‼️ Invalid Request in batch item ${i}: ${problem.reason}`);
@@ -232,45 +271,20 @@ function validateRpcRequest(req, res, next) {
       return;
     }
 
-    // Handle single requests
-    const jsonrpc = req.body?.jsonrpc;
-    const method = req.body?.method;
-    const id = req.body?.id;
-    
-    // Basic structure validation
-    if (!jsonrpc || jsonrpc !== "2.0" || !method || id === undefined) {
-      let reason = [];
-      if (!jsonrpc) reason.push('jsonrpc missing');
-      else if (jsonrpc !== "2.0") reason.push('jsonrpc must be "2.0"');
-      if (!method) reason.push('method missing');
-      if (id === undefined) reason.push('id missing');
-      
-      const reasonStr = reason.join(", ");
-      console.log("‼️ Invalid Request: " + reasonStr);
-      console.log("Request object:", req.body);
-
-      return sendErrorAndLog(
-        req, res,
-        -32600,
-        "Invalid Request: " + reasonStr,
-        id ?? null,
-        reasonStr
-      );
+    // Handle single requests (same rules as a batch item; one error object back)
+    const problem = itemProblem(req.body, exemptOrigin);
+    if (problem) {
+      if (problem.exemptOrigin) {
+        console.log(`🚫 Exempt origin ${req.headers.origin}: ${problem.reason}`);
+      } else if (problem.code === -32601) {
+        console.log(`🚫 Blocked namespace: ${problem.namespace} (method: ${req.body.method})`);
+      } else {
+        console.log("‼️ Invalid Request: " + problem.reason);
+        console.log("Request object:", req.body);
+      }
+      return sendErrorAndLog(req, res, problem.code, problem.message, req.body?.id ?? null, problem.reason);
     }
 
-    // Namespace validation
-    const blockedNamespace = getBlockedNamespace(method);
-    if (blockedNamespace) {
-      console.log(`🚫 Blocked namespace: ${blockedNamespace} (method: ${method})`);
-      return sendErrorAndLog(
-        req, res,
-        -32601,
-        `Method not supported: The '${blockedNamespace}' namespace is not available on this endpoint`,
-        id,
-        `blocked namespace '${blockedNamespace}' (method: ${method})`
-      );
-    }
-    
     next();
   } catch (err) {
     // FAIL-OPEN: If validation itself fails, log and let the request through

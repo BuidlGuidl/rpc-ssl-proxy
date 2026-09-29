@@ -75,7 +75,7 @@ Hard-blocked for every caller. Log range scans are expensive enough to degrade t
 
 `utils/rateLimiter.js` enforces a two-tier limit with two separate buckets.
 
-**Buckets.** Requests carrying a real public origin (a deployed dApp) are metered against that origin. Requests with no origin, a localhost origin, or a private-IP origin are metered against the client IP, on the assumption that they're individual developers. The `buidlguidl-client` origin is exempt entirely and is never counted.
+**Buckets.** Requests carrying a real public origin (a deployed dApp) are metered against that origin. Requests with no origin, a localhost origin, or a private-IP origin are metered against the client IP, on the assumption that they're individual developers. The `buidlguidl-client` origin is exempt and is never counted. Because `Origin` is a caller-set header, that exemption is held to the two calls the buidlguidl clients actually make: `eth_blockNumber`, and `eth_call` to the ENS Universal Resolver (addresses in `exemptOriginCallTargets`, `config.js`) with no state-override param. Anything else sent with that origin gets `-32601 Method not supported from this origin` from the validator, per item in a batch, before rate limiting or forwarding.
 
 **Tiers.** An hourly sliding window plus a daily hard cap. The sliding window blends the current and previous hour (`current + previous × weight`, where the weight decays from 1.0 to 0 across the hour) so callers can't burst across an hour boundary. Current limits, all in `config.js`:
 
