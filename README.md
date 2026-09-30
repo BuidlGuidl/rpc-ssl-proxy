@@ -69,7 +69,7 @@ This is the very first check in the request handler. Blacklisted IPs get a 429 w
 
 ### 4. `eth_getLogs` policy
 
-Log range scans are expensive enough to degrade the pool on their own, so `eth_getLogs` is the one method with its own admission policy (plan Phase 4, `bg-rpc-docs`). Today it is behind a switch: with `GETLOGS_KEYLESS_STAGE` unset, every `eth_getLogs` item is answered `-32601 eth_getLogs is not available on this endpoint` at its position (HTTP 200, no `Retry-After`, no units; the rest of a batch is processed normally) and none is forwarded. With the switch on, getLogs is served without an API key through the policy path below. The process refuses to start with the switch on unless `TARGET_URL` is a stage host or localhost, so it can't be left on in production by accident; API keys will replace it.
+Log range scans are expensive enough to degrade the pool on their own, so `eth_getLogs` is the one method with its own admission policy (plan Phase 4, `bg-rpc-docs`). It is behind a switch, `GETLOGS_KEYLESS` in `.env` (`GETLOGS_KEYLESS_STAGE` still works as an alias): on, getLogs is served to every caller through the policy path below, without an API key; off, every `eth_getLogs` item is answered `-32601 eth_getLogs is not available on this endpoint` at its position (HTTP 200, no `Retry-After`, no units; the rest of a batch is processed normally) and none is forwarded. The switch is on in production until the API-key pass lands (owner decision 2026-09-30); the startup log says which state it is in.
 
 The filter methods (`eth_newFilter`, `eth_newBlockFilter`, `eth_newPendingTransactionFilter`, `eth_getFilterChanges`, `eth_getFilterLogs`, `eth_uninstallFilter`, `disabledMethods` in `config.js`) are off regardless: a filter id exists only on the node that created it, so follow-up calls fail once there is more than one node. They are answered right after validation with `-32601 <method> is not supported on this endpoint; use eth_getLogs`, per item in a batch, before anything else runs.
 
@@ -169,6 +169,7 @@ Runtime secrets live in `.env` (see `.env.example`):
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | For Secrets Manager. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` | Circuit breaker alerts. Comma-separated chat IDs. |
 | `ADMIN_API_KEY` | Guards the admin endpoints. Generate with `openssl rand -hex 32`. |
+| `GETLOGS_KEYLESS` | `true` serves `eth_getLogs` to everyone through the policy path (section 4); unset or `false` answers it `-32601`. `GETLOGS_KEYLESS_STAGE` is accepted as an alias. |
 | `FIREBASE_*`, `GOOGLE_APPLICATION_CREDENTIALS` | Donation ledger. Currently unused (see above). |
 
 Tunable behaviour lives in `config.js`: rate limits, method weights, poll intervals, and the Firebase kill switch. Circuit breaker thresholds are currently set inline in `proxy.js`.

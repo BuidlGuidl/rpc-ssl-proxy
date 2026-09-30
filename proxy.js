@@ -46,20 +46,16 @@ console.log(`🔧 RPC Proxy Configuration:`);
 console.log(`   Primary URL: ${targetUrl || 'NOT SET'}`);
 console.log(`   Fallback URL: ${redactUrl(fallbackUrl)}`);
 
-// Stage-only switch (plan D10, Phase 4 policy pass): let getLogs through the policy
-// path WITHOUT an API key so the whole chain can be proven before keys exist. It
-// refuses to start unless TARGET_URL is a stage host or localhost, so it can't be
-// left on in production by accident. Removed when the keys pass lands.
-const getLogsKeylessStage = ['1', 'true', 'yes'].includes(String(process.env.GETLOGS_KEYLESS_STAGE || '').toLowerCase());
-if (getLogsKeylessStage) {
-  let host = '';
-  try { host = new URL(targetUrl).hostname; } catch { /* handled below */ }
-  const isStageHost = /^stage\./i.test(host) || host === 'localhost' || host === '127.0.0.1';
-  if (!isStageHost) {
-    console.error(`GETLOGS_KEYLESS_STAGE is set but TARGET_URL host "${host || targetUrl}" is not a stage host (stage.*) or localhost. Refusing to start.`);
-    process.exit(1);
-  }
-  console.log(`⚠️  GETLOGS_KEYLESS_STAGE is ON: getLogs is served without an API key (stage only, target ${host})`);
+// Keyless getLogs switch (plan D10, Phase 4 policy pass; owner decision 2026-09-30:
+// serve getLogs to everyone now, API keys are a later project). On: eth_getLogs takes
+// the policy path below without an API key. Off: every eth_getLogs item is answered
+// -32601. GETLOGS_KEYLESS_STAGE is accepted as an alias for existing .env files.
+const isOn = (v) => ['1', 'true', 'yes'].includes(String(v || '').toLowerCase());
+const getLogsKeyless = isOn(process.env.GETLOGS_KEYLESS) || isOn(process.env.GETLOGS_KEYLESS_STAGE);
+if (getLogsKeyless) {
+  console.log('🪵 getLogs is served without an API key (GETLOGS_KEYLESS)');
+} else {
+  console.log('🪵 eth_getLogs is blocked (-32601); set GETLOGS_KEYLESS=true to serve it');
 }
 
 // Initialize circuit breaker
@@ -301,7 +297,7 @@ app.post("/", async (req, res) => {
   // Retry-After, no units); the rest of a batch is processed normally. With the switch
   // they take the policy path below, after the rate limiter.
   let heavyItems = (Array.isArray(req.body) ? req.body : [req.body]).filter(r => getLogsMethods.includes(r?.method));
-  if (heavyItems.length > 0 && !getLogsKeylessStage) {
+  if (heavyItems.length > 0 && !getLogsKeyless) {
     console.log(`🚫 Blocked ${heavyItems.map(r => r.method).join(',')} from ${clientIP}`);
     if (!Array.isArray(req.body)) {
       res.status(200).json(methodUnavailableError(req.body?.id, req.body.method));
@@ -788,7 +784,7 @@ app.get("/status", (req, res) => {
     res.json({
       circuitBreaker: status,
       getLogs: {
-        keylessStage: getLogsKeylessStage,
+        keyless: getLogsKeyless,
         edgeInFlight: getLogsInFlight,
         edgeConcurrencyCap: getLogsGlobalConcurrency,
         ...getGetLogsState()
@@ -839,7 +835,7 @@ startRateLimitPolling();
 startWatchingBlacklist();
 
 // Head + receipt-floor pollers for the getLogs policy (only needed while the path is open)
-if (getLogsKeylessStage) {
+if (getLogsKeyless) {
   startGetLogsPollers(targetUrl);
 }
 
