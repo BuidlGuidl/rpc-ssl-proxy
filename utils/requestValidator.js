@@ -100,15 +100,26 @@ function allowedFromExemptOrigin(request) {
 }
 
 /**
- * Why one JSON-RPC item is unacceptable, or null if it's fine.
+ * Why one JSON-RPC item is unacceptable, or null if it's fine. `id` is what the error
+ * answer should echo: the item's id, or null when there is none or it is not a valid
+ * JSON-RPC id.
  * @param {object} request - one JSON-RPC item
  * @param {boolean} exemptOrigin - the request carries a rate-limit-exempt origin
- * @returns {{ code: number, message: string, reason: string, namespace?: string } | null}
+ * @returns {{ code: number, message: string, reason: string, id: *, namespace?: string } | null}
  */
 function itemProblem(request, exemptOrigin) {
-  const jsonrpc = request?.jsonrpc;
-  const method = request?.method;
-  const id = request?.id;
+  // A batch item that isn't an object can't be a request at all.
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    return { code: -32600, message: 'Invalid Request: request must be an object', reason: 'request must be an object', id: null };
+  }
+  const jsonrpc = request.jsonrpc;
+  const method = request.method;
+  const id = request.id;
+
+  // id must be a string, number or null (JSON-RPC 2.0); anything else is echoed as null.
+  if (id !== undefined && id !== null && typeof id !== 'string' && typeof id !== 'number') {
+    return { code: -32600, message: 'Invalid Request: id must be a string, number or null', reason: 'id must be a string, number or null', id: null };
+  }
 
   // method must be a non-empty string: every later check compares it by name
   // (namespaces, disabled methods, the getLogs policy, request units, the exempt
@@ -123,7 +134,7 @@ function itemProblem(request, exemptOrigin) {
     else if (methodBad) reason.push('method must be a string');
     if (id === undefined) reason.push('id missing');
     const reasonStr = reason.join(", ");
-    return { code: -32600, message: `Invalid Request: ${reasonStr}`, reason: reasonStr };
+    return { code: -32600, message: `Invalid Request: ${reasonStr}`, reason: reasonStr, id: id ?? null };
   }
 
   const blockedNamespace = getBlockedNamespace(method);
@@ -132,6 +143,7 @@ function itemProblem(request, exemptOrigin) {
       code: -32601,
       message: `Method not supported: The '${blockedNamespace}' namespace is not available on this endpoint`,
       reason: `blocked namespace '${blockedNamespace}' (method: ${method})`,
+      id: id ?? null,
       namespace: blockedNamespace
     };
   }
@@ -142,6 +154,7 @@ function itemProblem(request, exemptOrigin) {
       code: -32601,
       message: EXEMPT_ORIGIN_MESSAGE,
       reason: `exempt origin not allowed to call ${method}` + (method === 'eth_call' ? ` (to: ${request?.params?.[0]?.to ?? 'none'})` : ''),
+      id: id ?? null,
       exemptOrigin: true
     };
   }
@@ -225,13 +238,13 @@ function validateRpcRequest(req, res, next) {
       // Batch cap: the edge is the first layer to reject, so nothing downstream sees it
       if (req.body.length > maxBatchLength) {
         console.log(`‼️ Invalid Request: batch of ${req.body.length} exceeds max ${maxBatchLength}`);
-        return sendErrorAndLog(
-          req, res,
-          -32600,
-          `Batch too large (max ${maxBatchLength})`,
-          req.body[0]?.id ?? null,
-          `batch too large (${req.body.length} > ${maxBatchLength})`
-        );
+        logRejectedRequest(req, `batch too large (${req.body.length} > ${maxBatchLength})`);
+        // An array back, one answer per item (batch semantics), each with its own id.
+        return res.status(200).send(req.body.map(item => ({
+          jsonrpc: "2.0",
+          id: item?.id ?? null,
+          error: { code: -32600, message: `Batch too large (max ${maxBatchLength})` }
+        })));
       }
 
       // Validate each item. Invalid items are answered per item, at their position
@@ -250,7 +263,7 @@ function validateRpcRequest(req, res, next) {
         if (problem.exemptOrigin) {
           console.log(`🚫 Exempt origin ${req.headers.origin} in batch item ${i}: ${problem.reason}`);
         } else if (problem.code === -32601) {
-          console.log(`🚫 Blocked namespace in batch item ${i}: ${problem.namespace} (method: ${request.method})`);
+          console.log(`🚫 Blocked namespace in batch item ${i}: ${problem.namespace} (method: ${request?.method})`);
         } else {
           console.log(`‼️ Invalid Request in batch item ${i}: ${problem.reason}`);
           console.log("Request object:", request);
@@ -258,7 +271,7 @@ function validateRpcRequest(req, res, next) {
         reasons.push(`batch[${i}]: ${problem.reason}`);
         rejected.push({
           index: i,
-          response: { jsonrpc: "2.0", id: request?.id ?? null, error: { code: problem.code, message: problem.message } }
+          response: { jsonrpc: "2.0", id: problem.id, error: { code: problem.code, message: problem.message } }
         });
       }
 
@@ -268,7 +281,7 @@ function validateRpcRequest(req, res, next) {
           return res.status(200).send(rejected.map(r => r.response));
         }
         req.body = remaining;
-        spliceIntoBatchResponse(res, rejected);
+        spliceIntoBatchResponse(res, rejected, remaining);
       }
 
       // Mark as batch request for the handler
@@ -288,7 +301,7 @@ function validateRpcRequest(req, res, next) {
         console.log("‼️ Invalid Request: " + problem.reason);
         console.log("Request object:", req.body);
       }
-      return sendErrorAndLog(req, res, problem.code, problem.message, req.body?.id ?? null, problem.reason);
+      return sendErrorAndLog(req, res, problem.code, problem.message, problem.id, problem.reason);
     }
 
     next();
@@ -304,4 +317,4 @@ function validateRpcRequest(req, res, next) {
   }
 }
 
-export { validateRpcRequest, rejectBodyErrors, BLOCKED_NAMESPACES };
+export { validateRpcRequest, rejectBodyErrors, itemProblem, BLOCKED_NAMESPACES };

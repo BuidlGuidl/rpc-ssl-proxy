@@ -84,7 +84,17 @@ function upstreamFailureAnswer(id, error, { timeoutMs, what = 'upstream' } = {})
   return { kind: 'failed', body: jsonRpcError(id, -32603, 'Internal error: upstream request failed') };
 }
 
+/**
+ * One error answer for a whole request → one copy per item for a batch, each with the
+ * item's own id. Arrays and non-error bodies are returned unchanged.
+ */
+function perItem(body, answer) {
+  if (!Array.isArray(body) || Array.isArray(answer) || !answer || typeof answer !== 'object' || !answer.error) return answer;
+  return body.map(item => ({ jsonrpc: "2.0", id: item?.id ?? null, error: answer.error }));
+}
+
 export {
+  perItem,
   jsonRpcError,
   methodUnavailableError,
   rateLimitError,

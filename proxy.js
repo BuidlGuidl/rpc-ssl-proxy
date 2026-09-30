@@ -13,7 +13,7 @@ import dotenv from "dotenv";
 import { updateUrlCountMap, updateIpCountMap, startBackgroundTasks } from './utils/backgroundTasks.js';
 import { CircuitBreaker } from './utils/circuitBreaker.js';
 import { checkRateLimit, getRateLimitStatus, startRateLimitPolling, getSecondsUntilNextHour } from './utils/rateLimiter.js';
-import { jsonRpcError, methodUnavailableError, rateLimitError, plainRateLimitError, upstreamJsonRpcBody, upstreamFailureAnswer } from './utils/errorMessages.js';
+import { perItem, jsonRpcError, methodUnavailableError, rateLimitError, plainRateLimitError, upstreamJsonRpcBody, upstreamFailureAnswer } from './utils/errorMessages.js';
 import { validateRpcRequest, rejectBodyErrors } from './utils/requestValidator.js';
 import { rejectDisabledMethods } from './utils/disabledMethods.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
@@ -292,7 +292,7 @@ app.post("/", async (req, res) => {
     // from a limit from the outside).
     res.status(429)
       .set('Retry-After', '3600') // 1 hour
-      .json(plainRateLimitError(requestId));
+      .json(perItem(req.body, plainRateLimitError(requestId)));
     return;
   }
   
@@ -314,7 +314,7 @@ app.post("/", async (req, res) => {
       return;
     }
     req.body = remaining;
-    spliceIntoBatchResponse(res, blocked);
+    spliceIntoBatchResponse(res, blocked, remaining);
     heavyItems = [];
   }
 
@@ -335,7 +335,7 @@ app.post("/", async (req, res) => {
     
     res.status(429)
       .set('Retry-After', String(rateLimitResult.retryAfter || getSecondsUntilNextHour()))
-      .json(rateLimitError(requestId, rateLimitResult));
+      .json(perItem(req.body, rateLimitError(requestId, rateLimitResult)));
     return;
   }
   
@@ -383,7 +383,7 @@ app.post("/", async (req, res) => {
         return;
       }
       req.body = remaining;
-      spliceIntoBatchResponse(res, rejected);
+      spliceIntoBatchResponse(res, rejected, remaining);
     }
 
     // No accepted getLogs item left: the rest of the batch takes the normal path below.
@@ -394,7 +394,7 @@ app.post("/", async (req, res) => {
         console.log(`🪵 getLogs capacity: ${getLogsInFlight} in flight + ${slots} requested > ${getLogsGlobalConcurrency}, rejecting request from ${clientIP}`);
         res.status(429)
           .set('Retry-After', '2')
-          .json(jsonRpcError(requestIdOf(req.body), -32005, 'getLogs capacity exhausted at the edge, retry shortly'));
+          .json(perItem(req.body, jsonRpcError(requestIdOf(req.body), -32005, 'getLogs capacity exhausted at the edge, retry shortly')));
         return;
       }
 
@@ -442,22 +442,22 @@ app.post("/", async (req, res) => {
       if (restIndexes.length > 0) {
         const rest = restIndexes.map(i => items[i]);
         jobs.push(forwardGetLogsPath(rest, req.headers, clientIP, null).then(outcome => {
-          // Upstream answers (also a passed-through JSON-RPC error array) are matched by
-          // position, then by id; anything unmatched gets the classified error with its own id.
-          const upstreamAnswers = Array.isArray(outcome.data) ? outcome.data : null;
+          // A single error object from upstream (its own rate limit, a passed-through
+          // -32600, the classified failure) becomes each item's error with its own id;
+          // arrays are matched by position, then by id; anything still unmatched gets
+          // the generic -32603. Units only for answers without an error.
+          const restData = perItem(rest, outcome.data);
+          const upstreamAnswers = Array.isArray(restData) ? restData : null;
           const byPosition = upstreamAnswers && upstreamAnswers.length === rest.length;
           const byId = upstreamAnswers ? new Map(upstreamAnswers.map(a => [a?.id, a])) : null;
-          const failure = !outcome.ok && outcome.data?.error ? outcome.data.error : null;
           restIndexes.forEach((i, k) => {
             const item = items[i];
             let answer;
             if (byPosition) answer = upstreamAnswers[k];
             else if (byId && item?.id !== undefined && byId.has(item.id)) answer = byId.get(item.id);
             if (answer === undefined) {
-              answer = failure
-                ? jsonRpcError(item?.id ?? null, failure.code, failure.message, failure.data)
-                : jsonRpcError(item?.id ?? null, -32603, 'Internal error: upstream request failed');
-            } else if (outcome.ok) {
+              answer = jsonRpcError(item?.id ?? null, -32603, 'Internal error: upstream request failed');
+            } else if (!answer?.error) {
               servedUnits += requestUnits(item);
             }
             answers[i] = answer;
@@ -544,14 +544,16 @@ app.post("/", async (req, res) => {
         
         // Early return - don't count in Firebase since we used fallback
         responseData = response.data;
-        res.status(response.status).send(response.data);
+        res.status(response.status).send(perItem(req.body, response.data));
         console.log("🚨 Used immediate fallback - NOT counting in Firebase");
         return;
       }
     }
     
     responseData = response.data;
-    res.status(response.status).send(response.data);
+    // A provider that answers a whole batch with one error object still gives the
+    // caller an array (batch semantics).
+    res.status(response.status).send(perItem(req.body, response.data));
     
   } catch (error) {
     console.log("POST ERROR", error.message, isUsingFallback ? "(FALLBACK)" : "(PRIMARY)");
@@ -565,7 +567,7 @@ app.post("/", async (req, res) => {
     const answer = upstreamFailureAnswer(requestIdOf(req.body), error, { timeoutMs: 15000, what: 'upstream' });
     const primaryBody = answer.kind !== 'passthrough' && primaryFailure ? upstreamJsonRpcBody(primaryFailure) : null;
     console.log(`   Answering: ${primaryBody ? 'primary JSON-RPC body' : answer.kind}`);
-    res.status(200).json(primaryBody || answer.body);
+    res.status(200).json(perItem(req.body, primaryBody || answer.body));
     return; // Don't count failed requests in Firebase
   }
 

@@ -77,7 +77,7 @@ function rejectDisabledMethods(req, res, next) {
     // Process the rest normally, then splice the errors back in at their positions
     // (utils/batchMerge.js; a whole-batch error object is sent as-is).
     req.body = remaining;
-    spliceIntoBatchResponse(res, disabled);
+    spliceIntoBatchResponse(res, disabled, remaining);
     next();
   } catch (err) {
     // FAIL-OPEN like the validator: never take the proxy down over this check.
