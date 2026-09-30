@@ -10,8 +10,10 @@
  *     seconds (the lowest receipt_floor among ready reth nodes, D14: the oldest
  *     block any ready node can serve; the pool routes each request to nodes whose
  *     floor covers it)
- * Fail closed: until both are known and fresh, getLogs returns -32603 "getLogs not
- * ready". RECEIPT_FLOOR_OVERRIDE (env) pins the floor and is the only manual path.
+ * Fail closed: until both are known and fresh, getLogs returns -32005 "eth_getLogs is
+ * temporarily unavailable, retry shortly" (or "...: no node can serve it right now..."
+ * when the pool reports 0 ready nodes). RECEIPT_FLOOR_OVERRIDE (env) pins the floor
+ * and is the only manual path.
  */
 
 import axios from 'axios';
@@ -209,7 +211,24 @@ function validateGetLogs(item) {
   const head = currentHead();
   const floor = currentFloor();
   if (head === null || floor === null) {
-    return { ok: false, error: { code: -32603, message: 'getLogs not ready' }, blockCount: 0 };
+    // Fail closed, but say so in a retryable way (-32005, like the pool's own "no
+    // ready nodes" answer). Two reasons, told apart for the caller; the poll errors
+    // themselves stay in the edge's log and /status.
+    const noNodes = state.readyNodes === 0;
+    console.log(`🪵 getLogs unavailable: ${noNodes ? 'pool reports 0 ready getLogs nodes' : 'head or floor unknown/stale'}`
+      + ` (head ${head === null ? 'unknown' : 'ok'}, floor ${floor === null ? 'unknown' : 'ok'}`
+      + `${state.lastHeadError ? `; head poll: ${state.lastHeadError}` : ''}`
+      + `${state.lastFloorError ? `; floor poll: ${state.lastFloorError}` : ''})`);
+    return {
+      ok: false,
+      error: {
+        code: -32005,
+        message: noNodes
+          ? 'eth_getLogs is temporarily unavailable: no node can serve it right now, retry shortly'
+          : 'eth_getLogs is temporarily unavailable, retry shortly'
+      },
+      blockCount: 0
+    };
   }
 
   const filter = extractFilter(item?.params);
