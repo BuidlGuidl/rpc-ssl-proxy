@@ -12,7 +12,8 @@ import sslRootCas from "ssl-root-cas";
 import dotenv from "dotenv";
 import { updateUrlCountMap, updateIpCountMap, startBackgroundTasks } from './utils/backgroundTasks.js';
 import { CircuitBreaker } from './utils/circuitBreaker.js';
-import { checkRateLimit, buildRateLimitResponse, getRateLimitStatus, startRateLimitPolling, getSecondsUntilNextHour } from './utils/rateLimiter.js';
+import { checkRateLimit, getRateLimitStatus, startRateLimitPolling, getSecondsUntilNextHour } from './utils/rateLimiter.js';
+import { jsonRpcError, methodUnavailableError, rateLimitError, plainRateLimitError, upstreamJsonRpcBody, upstreamFailureAnswer } from './utils/errorMessages.js';
 import { validateRpcRequest, rejectBodyErrors } from './utils/requestValidator.js';
 import { rejectDisabledMethods } from './utils/disabledMethods.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
@@ -221,18 +222,12 @@ async function forwardGetLogsPath(data, headers, clientIP, errorId) {
     const response = await makeGetLogsRequest(data, headers, clientIP);
     return { ok: true, data: response.data, ms: Date.now() - startedAt, bytes: response.headers?.['content-length'] ?? '?' };
   } catch (error) {
-    const tooLarge = /maxContentLength|maxBodyLength/i.test(error.message || '');
-    console.log(`🪵 getLogs upstream error after ${Date.now() - startedAt} ms: ${error.code || 'no code'} ${error.message}`);
-    return {
-      ok: false,
-      ms: Date.now() - startedAt,
-      data: jsonRpcError(errorId, -32603, tooLarge ? 'Internal error: response too large' : 'Internal error: upstream request failed')
-    };
+    // A JSON-RPC body from bg-rpc-proxy (any HTTP status) is passed through; otherwise
+    // the failure is classified (timeout, unavailable, too large, other). Detail to the log.
+    const answer = upstreamFailureAnswer(errorId, error, { timeoutMs: getLogsUpstreamTimeoutMs, what: 'eth_getLogs' });
+    console.log(`🪵 getLogs upstream error after ${Date.now() - startedAt} ms: ${error.code || 'no code'} ${error.message} (HTTP ${error.response?.status ?? '-'}) → ${answer.kind}`);
+    return { ok: false, ms: Date.now() - startedAt, data: answer.body };
   }
-}
-
-function jsonRpcError(id, code, message) {
-  return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
 }
 
 // Helper function to make primary requests with circuit breaker
@@ -293,23 +288,34 @@ app.post("/", async (req, res) => {
       }
     }
     
-    // Return the same rate limit error for blacklisted IPs
+    // Blacklisted IPs get the plain rate-limit message on purpose (indistinguishable
+    // from a limit from the outside).
     res.status(429)
       .set('Retry-After', '3600') // 1 hour
-      .json(buildRateLimitResponse(requestId));
+      .json(plainRateLimitError(requestId));
     return;
   }
   
-  // getLogs and the filter methods (D9). Without the stage switch they are blocked
-  // for everyone (today's behavior; the keys pass replaces this with -32601). With it,
+  // getLogs and the filter methods (D9). Without the stage switch they are not offered
+  // to callers without a key: -32601 per item (not a rate limit, so HTTP 200, no
+  // Retry-After, no units); the rest of a batch is processed normally. With the switch
   // they take the policy path below, after the rate limiter.
-  const heavyItems = (Array.isArray(req.body) ? req.body : [req.body]).filter(r => getLogsMethods.includes(r?.method));
+  let heavyItems = (Array.isArray(req.body) ? req.body : [req.body]).filter(r => getLogsMethods.includes(r?.method));
   if (heavyItems.length > 0 && !getLogsKeylessStage) {
     console.log(`🚫 Blocked ${heavyItems.map(r => r.method).join(',')} from ${clientIP}`);
-    res.status(429)
-      .set('Retry-After', String(getSecondsUntilNextHour()))
-      .json(buildRateLimitResponse(requestIdOf(req.body)));
-    return;
+    if (!Array.isArray(req.body)) {
+      res.status(200).json(methodUnavailableError(req.body?.id, req.body.method));
+      return;
+    }
+    const blocked = heavyItems.map(item => ({ index: req.body.indexOf(item), response: methodUnavailableError(item?.id, item.method) }));
+    const remaining = req.body.filter(item => !heavyItems.includes(item));
+    if (remaining.length === 0) {
+      res.status(200).json(blocked.map(b => b.response));
+      return;
+    }
+    req.body = remaining;
+    spliceIntoBatchResponse(res, blocked);
+    heavyItems = [];
   }
 
   // Check rate limit before any other processing
@@ -329,7 +335,7 @@ app.post("/", async (req, res) => {
     
     res.status(429)
       .set('Retry-After', String(rateLimitResult.retryAfter || getSecondsUntilNextHour()))
-      .json(buildRateLimitResponse(requestId));
+      .json(rateLimitError(requestId, rateLimitResult));
     return;
   }
   
@@ -436,16 +442,22 @@ app.post("/", async (req, res) => {
       if (restIndexes.length > 0) {
         const rest = restIndexes.map(i => items[i]);
         jobs.push(forwardGetLogsPath(rest, req.headers, clientIP, null).then(outcome => {
-          const byPosition = outcome.ok && Array.isArray(outcome.data) && outcome.data.length === rest.length;
-          const byId = outcome.ok && Array.isArray(outcome.data) ? new Map(outcome.data.map(a => [a?.id, a])) : null;
+          // Upstream answers (also a passed-through JSON-RPC error array) are matched by
+          // position, then by id; anything unmatched gets the classified error with its own id.
+          const upstreamAnswers = Array.isArray(outcome.data) ? outcome.data : null;
+          const byPosition = upstreamAnswers && upstreamAnswers.length === rest.length;
+          const byId = upstreamAnswers ? new Map(upstreamAnswers.map(a => [a?.id, a])) : null;
+          const failure = !outcome.ok && outcome.data?.error ? outcome.data.error : null;
           restIndexes.forEach((i, k) => {
             const item = items[i];
             let answer;
-            if (byPosition) answer = outcome.data[k];
+            if (byPosition) answer = upstreamAnswers[k];
             else if (byId && item?.id !== undefined && byId.has(item.id)) answer = byId.get(item.id);
             if (answer === undefined) {
-              answer = jsonRpcError(item?.id ?? null, -32603, 'Internal error: upstream request failed');
-            } else {
+              answer = failure
+                ? jsonRpcError(item?.id ?? null, failure.code, failure.message, failure.data)
+                : jsonRpcError(item?.id ?? null, -32603, 'Internal error: upstream request failed');
+            } else if (outcome.ok) {
               servedUnits += requestUnits(item);
             }
             answers[i] = answer;
@@ -504,6 +516,7 @@ app.post("/", async (req, res) => {
     });
   }
 
+  let primaryFailure = null; // the primary's error when the fallback retry also fails
   try {
     let response;
     
@@ -519,6 +532,7 @@ app.post("/", async (req, res) => {
         // Don't delete this
         // console.log("POST RESPONSE", response.data, "(PRIMARY)");
       } catch (primaryError) {
+        primaryFailure = primaryError;
         console.log("POST ERROR", primaryError.message, "(PRIMARY)");
         
         // Primary failed, try fallback immediately
@@ -543,16 +557,15 @@ app.post("/", async (req, res) => {
     console.log("POST ERROR", error.message, isUsingFallback ? "(FALLBACK)" : "(PRIMARY)");
     console.log(`   Error details: ${error.code || 'No code'} - ${error.response?.status || 'No status'}`);
     
-    // Always JSON-RPC, always HTTP 200, like every other error path. The detail stays
-    // in the log: error.message can name internal hosts and ports.
-    res.status(200).json({
-      jsonrpc: "2.0",
-      id: requestIdOf(req.body),
-      error: {
-        code: -32603,
-        message: "Internal error: upstream request failed"
-      }
-    });
+    // Always JSON-RPC, always HTTP 200. A JSON-RPC body from the failing upstream is
+    // passed through; otherwise the failure is classified (timeout / unavailable /
+    // other). If the fallback failed without a body but the primary had answered one,
+    // the primary's body is the more useful answer. error.message can name internal
+    // hosts and ports, so it stays in the log.
+    const answer = upstreamFailureAnswer(requestIdOf(req.body), error, { timeoutMs: 15000, what: 'upstream' });
+    const primaryBody = answer.kind !== 'passthrough' && primaryFailure ? upstreamJsonRpcBody(primaryFailure) : null;
+    console.log(`   Answering: ${primaryBody ? 'primary JSON-RPC body' : answer.kind}`);
+    res.status(200).json(primaryBody || answer.body);
     return; // Don't count failed requests in Firebase
   }
 

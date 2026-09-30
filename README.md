@@ -65,11 +65,11 @@ Rejections return **HTTP 200** with a JSON-RPC error body: `-32700` for an empty
 
 `utils/ipBlacklist.js` reads `ip_blacklist.txt` (one IP per line, `#` comments supported) into an in-memory set and re-reads it automatically when the file changes, polling every 5 seconds. No restart needed to ban someone.
 
-This is the very first check in the request handler. Blacklisted IPs get a 429 with the same body a rate-limited caller sees, so the blacklist isn't distinguishable from the outside. The check fails open on error.
+This is the very first check in the request handler. Blacklisted IPs get a 429 with the plain `-32005 Rate limit exceeded.` body (deliberately without the detail a real limit carries, see section 5), so the blacklist isn't distinguishable from the outside. The check fails open on error.
 
 ### 4. `eth_getLogs` policy
 
-Log range scans are expensive enough to degrade the pool on their own, so `eth_getLogs` is the one method with its own admission policy (plan Phase 4, `bg-rpc-docs`). Today it is behind a switch: with `GETLOGS_KEYLESS_STAGE` unset, any request containing `eth_getLogs` gets the same HTTP 429 a rate-limited caller sees, for the whole request, and nothing is forwarded. With the switch on, getLogs is served without an API key through the policy path below. The process refuses to start with the switch on unless `TARGET_URL` is a stage host or localhost, so it can't be left on in production by accident; API keys will replace it.
+Log range scans are expensive enough to degrade the pool on their own, so `eth_getLogs` is the one method with its own admission policy (plan Phase 4, `bg-rpc-docs`). Today it is behind a switch: with `GETLOGS_KEYLESS_STAGE` unset, every `eth_getLogs` item is answered `-32601 eth_getLogs is not available on this endpoint` at its position (HTTP 200, no `Retry-After`, no units; the rest of a batch is processed normally) and none is forwarded. With the switch on, getLogs is served without an API key through the policy path below. The process refuses to start with the switch on unless `TARGET_URL` is a stage host or localhost, so it can't be left on in production by accident; API keys will replace it.
 
 The filter methods (`eth_newFilter`, `eth_newBlockFilter`, `eth_newPendingTransactionFilter`, `eth_getFilterChanges`, `eth_getFilterLogs`, `eth_uninstallFilter`, `disabledMethods` in `config.js`) are off regardless: a filter id exists only on the node that created it, so follow-up calls fail once there is more than one node. They are answered right after validation with `-32601 <method> is not supported on this endpoint; use eth_getLogs`, per item in a batch, before anything else runs.
 
@@ -94,7 +94,9 @@ The filter methods (`eth_newFilter`, `eth_newBlockFilter`, `eth_newPendingTransa
 
 **Weights.** Limits are denominated in weighted units, not raw calls, using the shared request cost table in `utils/requestUnits.js` (the same units the RPC pool uses for load balancing and API-key metering will use): `eth_getLogs` counts 1 + ⌈blocks / 1000⌉ (2 for up to 1,000 blocks, 11 for the 10,000 cap; a `blockHash` filter is 1 block), `eth_getBlockReceipts`, `eth_getBlockByNumber` and `eth_getBlockByHash` count 2, `eth_feeHistory` counts 1 + ⌈blockCount / 100⌉ (capped at 1,024 blocks), `eth_getProof` counts 1 + ⌈storageKeys / 10⌉, everything else counts 1, and a batch counts the sum of its items.
 
-Enforcement itself is a fast in-memory set lookup on every request. The blocklists behind it are refreshed from Postgres every 10 seconds by a background poll. Limited callers get a 429 with JSON-RPC error `-32005` and a `Retry-After` header. The check fails open.
+Enforcement itself is a fast in-memory set lookup on every request. The blocklists behind it are refreshed from Postgres every 10 seconds by a background poll. Limited callers get a 429 with JSON-RPC error `-32005` naming the limit that tripped and when to retry, e.g. `Rate limit exceeded: 1,000 request units per hour for requests without an Origin header; retry in 318 s`, the seconds also in `error.data.retryAfter` and the `Retry-After` header. The check fails open.
+
+**Upstream failures** (`utils/errorMessages.js`, shared by the normal and getLogs paths) are answered as JSON-RPC, HTTP 200: a JSON-RPC error body from bg-rpc-proxy or the fallback is passed through whatever its HTTP status; a timeout says `-32603 Internal error: upstream timed out after 15 s` (`eth_getLogs timed out after 12 s` on the getLogs path); no connection says `-32603 Internal error: upstream unavailable`; a getLogs answer over the size cap says `Internal error: response too large`; anything else keeps `Internal error: upstream request failed`. Internal hosts, ports and provider URLs never appear in an answer.
 
 ### 6. Forward upstream, with a circuit breaker
 

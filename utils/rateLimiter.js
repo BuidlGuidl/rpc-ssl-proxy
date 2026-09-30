@@ -1,5 +1,6 @@
 import { getPool } from './postgresClient.js';
 import { isLocalOrigin as isUntrackedOrigin, normalizeOrigin } from './originValidator.js';
+import { plainRateLimitError } from './errorMessages.js';
 import { 
   originRateLimitPerHour, 
   ipRateLimitPerHour, 
@@ -509,6 +510,7 @@ function checkRateLimit(ip, origin) {
         return {
           limited: true,
           reason: `Origin ${cleanOrigin} has exceeded daily rate limit (${count}/${originRateLimitPerDay} requests/day)`,
+          scope: 'origin', window: 'day', limit: originRateLimitPerDay, origin: cleanOrigin,
           retryAfter: getSecondsUntilMidnightUTC()
         };
       }
@@ -521,6 +523,7 @@ function checkRateLimit(ip, origin) {
         return {
           limited: true,
           reason: `Origin ${cleanOrigin} has exceeded hourly rate limit (~${count}/${originRateLimitPerHour} requests/hour)`,
+          scope: 'origin', window: 'hour', limit: originRateLimitPerHour, origin: cleanOrigin,
           retryAfter: getSecondsUntilNextHour()
         };
       }
@@ -535,6 +538,7 @@ function checkRateLimit(ip, origin) {
         return {
           limited: true,
           reason: `IP ${ip} has exceeded daily rate limit for non-origin requests (${count}/${ipRateLimitPerDay} requests/day)`,
+          scope: 'ip', window: 'day', limit: ipRateLimitPerDay,
           retryAfter: getSecondsUntilMidnightUTC()
         };
       }
@@ -547,6 +551,7 @@ function checkRateLimit(ip, origin) {
         return {
           limited: true,
           reason: `IP ${ip} has exceeded hourly rate limit for non-origin requests (~${count}/${ipRateLimitPerHour} requests/hour)`,
+          scope: 'ip', window: 'hour', limit: ipRateLimitPerHour,
           retryAfter: getSecondsUntilNextHour()
         };
       }
@@ -595,15 +600,11 @@ function getSecondsUntilMidnightUTC() {
  * Build a JSON-RPC rate limit error response
  * @param {*} requestId - The id from the JSON-RPC request (to echo back)
  */
+// Kept for callers that want the undetailed answer (blacklisted IPs). Limited callers
+// get rateLimitError(id, checkRateLimit(...)) from utils/errorMessages.js, which names
+// the limit that tripped and when to retry.
 function buildRateLimitResponse(requestId = null) {
-  return {
-    jsonrpc: "2.0",
-    id: requestId,
-    error: {
-      code: -32005,
-      message: "Rate limit exceeded."
-    }
-  };
+  return plainRateLimitError(requestId);
 }
 
 /**
