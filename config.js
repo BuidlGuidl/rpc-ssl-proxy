@@ -93,6 +93,17 @@ const disabledMethods = [
   'eth_uninstallFilter'
 ];
 
+/**
+ * Subscription methods, answered at the edge with -32601 and the message here. They
+ * need a WebSocket connection and this endpoint is HTTP only; forwarded, the nodes
+ * answer -32603 "Internal error", which reads as an outage and invites retries.
+ * Edge-only (no pool counterpart); handled by the same middleware as disabledMethods.
+ */
+const wsOnlyMethods = {
+  eth_subscribe: 'eth_subscribe requires a WebSocket connection; this endpoint is HTTP only. Poll eth_blockNumber or eth_getLogs instead',
+  eth_unsubscribe: 'eth_unsubscribe requires a WebSocket connection; this endpoint is HTTP only'
+};
+
 /** Methods that get the getLogs policy and forwarding path (D9). While D15 is in force the filter methods never reach this path. */
 const getLogsMethods = ['eth_getLogs', 'eth_newFilter', 'eth_getFilterLogs', 'eth_getFilterChanges'];
 
@@ -161,6 +172,7 @@ export {
   maxRequestBodySize,
   forwardedHeaders,
   disabledMethods,
+  wsOnlyMethods,
   getLogsMethods,
   getLogsMaxBlockRange,
   getLogsMaxAddresses,

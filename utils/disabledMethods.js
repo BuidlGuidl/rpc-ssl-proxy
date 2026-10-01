@@ -1,6 +1,8 @@
 /**
- * Reject disabled methods (bg-rpc-docs plan, D15) with HTTP 200 and
- * -32601 "<method> is not supported on this endpoint; use eth_getLogs".
+ * Reject disabled methods with HTTP 200 and -32601:
+ *   - filter methods (bg-rpc-docs plan, D15, config.js disabledMethods):
+ *     "<method> is not supported on this endpoint; use eth_getLogs"
+ *   - subscription methods (config.js wsOnlyMethods): the message listed there
  *
  * Runs right after request validation and before everything else in the POST
  * pipeline (blacklist, getLogs policy, rate limiter, forwarding), so a disabled
@@ -13,11 +15,15 @@
  * of errors is sent directly.
  */
 
-import { disabledMethods } from '../config.js';
+import { disabledMethods, wsOnlyMethods } from '../config.js';
 import { logRejectedRequest } from './rejectLogger.js';
 import { spliceIntoBatchResponse } from './batchMerge.js';
 
-const disabledSet = new Set(disabledMethods);
+// method → the -32601 message it is answered with
+const refusals = new Map([
+  ...disabledMethods.map(m => [m, `${m} is not supported on this endpoint; use eth_getLogs`]),
+  ...Object.entries(wsOnlyMethods)
+]);
 
 function disabledError(item) {
   return {
@@ -25,7 +31,7 @@ function disabledError(item) {
     id: item?.id ?? null,
     error: {
       code: -32601,
-      message: `${item.method} is not supported on this endpoint; use eth_getLogs`
+      message: refusals.get(item.method)
     }
   };
 }
@@ -39,8 +45,8 @@ function rejectDisabledMethods(req, res, next) {
 
     // Single request
     if (!Array.isArray(req.body)) {
-      if (disabledSet.has(req.body.method)) {
-        console.log(`🚫 Disabled method ${req.body.method} (D15)`);
+      if (refusals.has(req.body.method)) {
+        console.log(`🚫 Disabled method ${req.body.method}`);
         logRejectedRequest(req, `disabled method ${req.body.method}`);
         res.status(200).json(disabledError(req.body));
         return;
@@ -53,8 +59,8 @@ function rejectDisabledMethods(req, res, next) {
     const disabled = []; // { index, response }
     const remaining = [];
     req.body.forEach((item, index) => {
-      if (disabledSet.has(item?.method)) {
-        disabled.push({ index, response: disabledError(item) });
+      if (refusals.has(item?.method)) {
+        disabled.push({ index, method: item.method, response: disabledError(item) });
       } else {
         remaining.push(item);
       }
@@ -65,8 +71,8 @@ function rejectDisabledMethods(req, res, next) {
       return;
     }
 
-    const names = disabled.map(d => d.response.error.message.split(' ')[0]).join(',');
-    console.log(`🚫 Disabled method(s) in batch: ${names} (${disabled.length} of ${req.body.length} items, D15)`);
+    const names = disabled.map(d => d.method).join(',');
+    console.log(`🚫 Disabled method(s) in batch: ${names} (${disabled.length} of ${req.body.length} items)`);
     logRejectedRequest(req, `disabled method(s) in batch: ${names}`);
 
     if (remaining.length === 0) {
@@ -86,4 +92,4 @@ function rejectDisabledMethods(req, res, next) {
   }
 }
 
-export { rejectDisabledMethods };
+export { rejectDisabledMethods, disabledError };
