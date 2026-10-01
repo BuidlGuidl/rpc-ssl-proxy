@@ -19,7 +19,7 @@ import { rejectDisabledMethods } from './utils/disabledMethods.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
 import {
-  forwardedHeaders, maxRequestBodySize,
+  maxRequestBodySize,
   getLogsMethods, getLogsGlobalConcurrency, getLogsMaxPerBatch, getLogsUpstreamTimeoutMs, getLogsMaxResponseBytes
 } from './config.js';
 import { redactUrl } from './utils/redactUrl.js';
@@ -27,6 +27,7 @@ import { validateGetLogs, startGetLogsPollers, getGetLogsState } from './utils/g
 import { requestUnits } from './utils/requestUnits.js';
 import { spliceIntoBatchResponse } from './utils/batchMerge.js';
 import { internalAgent } from './utils/internalAgent.js';
+import { upstreamHeaders } from './utils/upstreamHeaders.js';
 
 var app = express();
 https.globalAgent.options.ca = sslRootCas.create();
@@ -136,27 +137,6 @@ function getOrigin(req) {
     // If anything goes wrong, return 'unknown' to avoid breaking the application
     return 'unknown';
   }
-}
-
-// Build the header set for the next hop. Only the allowlisted caller headers cross
-// (see forwardedHeaders in config.js); Content-Type is always ours because the body
-// is re-serialized from req.body. When clientIP is given (requests to TARGET_URL,
-// bg-rpc-proxy, which logs it), X-Client-IP carries the caller's socket address as
-// seen by this edge: the same value the rate limiter uses (getClientIP). A caller's
-// own X-Client-IP is never forwarded (it isn't in the allowlist). Calls without
-// clientIP (the fallback provider) never get the header.
-function upstreamHeaders(clientHeaders, clientIP) {
-  const headers = { "Content-Type": "application/json" };
-  for (const name of forwardedHeaders) {
-    const value = clientHeaders?.[name];
-    if (typeof value === 'string' && value !== '') {
-      headers[name] = value;
-    }
-  }
-  if (typeof clientIP === 'string' && clientIP !== '') {
-    headers["X-Client-IP"] = clientIP;
-  }
-  return headers;
 }
 
 // JSON-RPC id to echo in an error response: the request's id, or the first item's

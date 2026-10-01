@@ -70,6 +70,27 @@ function isLocalOrigin(origin) {
 }
 
 /**
+ * The one rule for what the edge does with a request's Origin (bg-rpc-docs
+ * ORIGIN_CLASS_PLAN.md, D2). checkRateLimit branches on it, and upstreamHeaders strips
+ * 'untracked' origins from the copy sent downstream (D7), so the two can't disagree.
+ *
+ *   'none'      no Origin header (missing or empty): limited per IP
+ *   'exempt'    buidlguidl-client, any capitalization: never counted or limited
+ *   'tracked'   a real origin: counted and limited per origin
+ *   'untracked' an Origin the edge won't track (local, ports, IPs, '*', ...): limited per IP
+ *
+ * Exempt is checked before the local rule (D8): isLocalOrigin alone counts
+ * 'buidlguidl-client' as local (it has no dot).
+ */
+function classifyOrigin(origin) {
+  if (!origin) return 'none';
+  if (isExemptOrigin(origin)) return 'exempt';
+  const cleanOrigin = normalizeOrigin(origin);
+  if (cleanOrigin && !isLocalOrigin(cleanOrigin)) return 'tracked';
+  return 'untracked';
+}
+
+/**
  * Check if origins_last_hour column exists in the database
  */
 async function checkOriginsLastHourExists(pool) {
@@ -491,15 +512,16 @@ async function pollRateLimitData() {
  */
 function checkRateLimit(ip, origin) {
   try {
+    const originClass = classifyOrigin(origin);
+
     // Exempt origins are never counted and never limited (see EXEMPT_ORIGINS)
-    if (isExemptOrigin(origin)) {
+    if (originClass === 'exempt') {
       return { limited: false, reason: null, retryAfter: null };
     }
 
     const cleanOrigin = normalizeOrigin(origin);
-    const hasRealOrigin = cleanOrigin && !isLocalOrigin(cleanOrigin);
 
-    if (hasRealOrigin) {
+    if (originClass === 'tracked') {
       // This is a deployed app - check origin-based limits
       
       // Check DAILY limit first (longer block)
@@ -528,7 +550,7 @@ function checkRateLimit(ip, origin) {
         };
       }
     } else {
-      // This is local testing - check IP-based limits
+      // No origin, or one the edge doesn't track ('none' / 'untracked') - check IP-based limits
       
       // Check DAILY limit first (longer block)
       if (state.dailyBlockedIPs.has(ip)) {
@@ -745,6 +767,7 @@ function startRateLimitPolling() {
 
 export {
   checkRateLimit,
+  classifyOrigin,
   buildRateLimitResponse,
   getRateLimitStatus,
   startRateLimitPolling,
