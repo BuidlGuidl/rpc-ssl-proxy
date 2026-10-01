@@ -3,6 +3,8 @@
  *   - filter methods (bg-rpc-docs plan, D15, config.js disabledMethods):
  *     "<method> is not supported on this endpoint; use eth_getLogs"
  *   - subscription methods (config.js wsOnlyMethods): the message listed there
+ *   - methods not served (config.js unsupportedMethods, bg-rpc-docs
+ *     EDGE_METHOD_BLOCKLIST_PLAN.md D2): the message listed there
  *
  * Runs right after request validation and before everything else in the POST
  * pipeline (blacklist, getLogs policy, rate limiter, forwarding), so a disabled
@@ -15,14 +17,15 @@
  * of errors is sent directly.
  */
 
-import { disabledMethods, wsOnlyMethods } from '../config.js';
+import { disabledMethods, wsOnlyMethods, unsupportedMethods } from '../config.js';
 import { logRejectedRequest } from './rejectLogger.js';
 import { spliceIntoBatchResponse } from './batchMerge.js';
 
 // method → the -32601 message it is answered with
 const refusals = new Map([
   ...disabledMethods.map(m => [m, `${m} is not supported on this endpoint; use eth_getLogs`]),
-  ...Object.entries(wsOnlyMethods)
+  ...Object.entries(wsOnlyMethods),
+  ...Object.entries(unsupportedMethods)
 ]);
 
 function disabledError(item) {

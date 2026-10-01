@@ -104,6 +104,28 @@ const wsOnlyMethods = {
   eth_unsubscribe: 'eth_unsubscribe requires a WebSocket connection; this endpoint is HTTP only'
 };
 
+/**
+ * Single methods no node here serves consistently, answered at the edge with -32601 and
+ * the message here (bg-rpc-docs EDGE_METHOD_BLOCKLIST_PLAN.md, D2/D3). Whole namespaces
+ * (trace_, txpool_, ...) are refused by BLOCKED_NAMESPACES in utils/requestValidator.js.
+ * Edge-only; handled by the same middleware as disabledMethods.
+ */
+const unsupported = (m) => `${m} is not supported on this endpoint`;
+const keylessHint = '; sign locally and use eth_sendRawTransaction';
+const unsupportedMethods = {
+  // proof-of-work leftovers: reth answers -32603 unimplemented, other clients may answer
+  eth_coinbase: unsupported('eth_coinbase'),
+  eth_mining: unsupported('eth_mining'),
+  eth_hashrate: unsupported('eth_hashrate'),
+  eth_getWork: unsupported('eth_getWork'),
+  eth_submitWork: unsupported('eth_submitWork'),
+  eth_submitHashrate: unsupported('eth_submitHashrate'),
+  // the nodes hold no keys (-32602 unknown account)
+  eth_sendTransaction: unsupported('eth_sendTransaction') + keylessHint,
+  eth_sign: unsupported('eth_sign') + keylessHint,
+  eth_signTransaction: unsupported('eth_signTransaction') + keylessHint
+};
+
 /** Methods that get the getLogs policy and forwarding path (D9). While D15 is in force the filter methods never reach this path. */
 const getLogsMethods = ['eth_getLogs', 'eth_newFilter', 'eth_getFilterLogs', 'eth_getFilterChanges'];
 
@@ -173,6 +195,7 @@ export {
   forwardedHeaders,
   disabledMethods,
   wsOnlyMethods,
+  unsupportedMethods,
   getLogsMethods,
   getLogsMaxBlockRange,
   getLogsMaxAddresses,
