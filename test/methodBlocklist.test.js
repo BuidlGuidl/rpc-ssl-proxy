@@ -42,11 +42,13 @@ const NS_METHODS = {
   proof: ['proof_getTransactionByHash']
 };
 const METHODS = ['eth_coinbase', 'eth_mining', 'eth_hashrate', 'eth_getWork', 'eth_submitWork', 'eth_submitHashrate',
-  'eth_sendTransaction', 'eth_sign', 'eth_signTransaction'];
+  'eth_sendTransaction', 'eth_sign', 'eth_signTransaction',
+  'eth_signTypedData', 'eth_signTypedData_v1', 'eth_signTypedData_v3', 'eth_signTypedData_v4'];
 const KEYLESS = ['eth_sendTransaction', 'eth_sign', 'eth_signTransaction'];
+const TYPED_DATA = ['eth_signTypedData', 'eth_signTypedData_v1', 'eth_signTypedData_v3', 'eth_signTypedData_v4'];
 // Served, and sharing a prefix with something refused.
 const SERVED = ['eth_call', 'eth_getTransactionCount', 'net_version', 'eth_accounts', 'eth_getProof',
-  'eth_sendRawTransaction', 'eth_signTypedData_v4', 'eth_blockNumber', 'eth_getTransactionByHash', 'eth_getLogs'];
+  'eth_sendRawTransaction', 'eth_blockNumber', 'eth_getTransactionByHash', 'eth_getLogs'];
 
 test('every D2 namespace: -32601 with the existing namespace message, not forwarded', () => {
   for (const ns of NAMESPACES) {
@@ -70,7 +72,8 @@ test('every D2 method: -32601 "<method> is not supported on this endpoint", hint
     assert.equal(out.body.id, 'x', m);
     assert.equal(out.body.error.code, -32601, m);
     const expected = `${m} is not supported on this endpoint` +
-      (KEYLESS.includes(m) ? '; sign locally and use eth_sendRawTransaction' : '');
+      (KEYLESS.includes(m) ? '; sign locally and use eth_sendRawTransaction' : '') +
+      (TYPED_DATA.includes(m) ? '; sign typed data in your wallet' : '');
     assert.equal(out.body.error.message, expected, m);
   }
 });
@@ -101,6 +104,21 @@ test('batch: refused items answered at their position, the rest forwarded and se
   assert.match(out.body[3].error.message, /^eth_sendTransaction is not supported on this endpoint; sign locally/);
   assert.match(out.body[4].error.message, /'web3' namespace/);
   assert.match(out.body[5].error.message, /use eth_getLogs$/);
+});
+
+test('batch: every typed-data method answered at its position between served items', () => {
+  const body = [item(0, 'eth_chainId')];
+  TYPED_DATA.forEach((m, i) => body.push(item(10 + i, m, ['0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045', '{}'])));
+  body.push(item(99, 'eth_blockNumber'));
+  const out = pipeline(body);
+  assert.deepEqual(out.forwarded.map(i => i.id), [0, 99]);
+  assert.deepEqual(out.body.map(a => a.id), [0, 10, 11, 12, 13, 99]);
+  assert.equal(out.body[0].result, '0x1');
+  assert.equal(out.body[5].result, '0x1');
+  TYPED_DATA.forEach((m, i) => {
+    assert.equal(out.body[1 + i].error.code, -32601);
+    assert.equal(out.body[1 + i].error.message, `${m} is not supported on this endpoint; sign typed data in your wallet`);
+  });
 });
 
 test('batch: all items refused → array of errors, nothing forwarded', () => {

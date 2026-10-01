@@ -112,6 +112,7 @@ const wsOnlyMethods = {
  */
 const unsupported = (m) => `${m} is not supported on this endpoint`;
 const keylessHint = '; sign locally and use eth_sendRawTransaction';
+const typedDataHint = '; sign typed data in your wallet';
 const unsupportedMethods = {
   // proof-of-work leftovers: reth answers -32603 unimplemented, other clients may answer
   eth_coinbase: unsupported('eth_coinbase'),
@@ -123,7 +124,12 @@ const unsupportedMethods = {
   // the nodes hold no keys (-32602 unknown account)
   eth_sendTransaction: unsupported('eth_sendTransaction') + keylessHint,
   eth_sign: unsupported('eth_sign') + keylessHint,
-  eth_signTransaction: unsupported('eth_signTransaction') + keylessHint
+  eth_signTransaction: unsupported('eth_signTransaction') + keylessHint,
+  // EIP-712 signing: also needs the signer's key; wallets answer these, not nodes
+  eth_signTypedData: unsupported('eth_signTypedData') + typedDataHint,
+  eth_signTypedData_v1: unsupported('eth_signTypedData_v1') + typedDataHint,
+  eth_signTypedData_v3: unsupported('eth_signTypedData_v3') + typedDataHint,
+  eth_signTypedData_v4: unsupported('eth_signTypedData_v4') + typedDataHint
 };
 
 /** Methods that get the getLogs policy and forwarding path (D9). While D15 is in force the filter methods never reach this path. */
