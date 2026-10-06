@@ -30,11 +30,11 @@ function pipeline(body, headers = {}) {
   return out;
 }
 
-const NAMESPACES = ['trace', 'txpool', 'web3', 'erigon', 'alchemy', 'parity', 'ots', 'proof'];
+const NAMESPACES = ['trace', 'txpool', 'rpc', 'erigon', 'alchemy', 'parity', 'ots', 'proof'];
 const NS_METHODS = {
   trace: ['trace_block', 'trace_transaction', 'trace_call', 'trace_filter'],
   txpool: ['txpool_status', 'txpool_content', 'txpool_inspect'],
-  web3: ['web3_clientVersion', 'web3_sha3'],
+  rpc: ['rpc_modules'],
   erigon: ['erigon_getHeaderByNumber'],
   alchemy: ['alchemy_getTokenBalances', 'alchemy_getAssetTransfers'],
   parity: ['parity_pendingTransactions'],
@@ -92,7 +92,7 @@ test('batch: refused items answered at their position, the rest forwarded and se
     item(2, 'trace_block', ['latest']),
     item(3, 'eth_call'),
     item(4, 'eth_sendTransaction'),
-    item(5, 'web3_clientVersion'),
+    item(5, 'rpc_modules'),
     item(6, 'eth_newFilter'),
     item(7, 'eth_accounts')
   ];
@@ -102,7 +102,7 @@ test('batch: refused items answered at their position, the rest forwarded and se
   assert.deepEqual(out.body.map(a => a.error?.code ?? 'ok'), ['ok', -32601, 'ok', -32601, -32601, -32601, 'ok']);
   assert.match(out.body[1].error.message, /'trace' namespace/);
   assert.match(out.body[3].error.message, /^eth_sendTransaction is not supported on this endpoint; sign locally/);
-  assert.match(out.body[4].error.message, /'web3' namespace/);
+  assert.match(out.body[4].error.message, /'rpc' namespace/);
   assert.match(out.body[5].error.message, /use eth_getLogs$/);
 });
 

@@ -30,12 +30,12 @@ import { isExemptOrigin } from './rateLimiter.js';
  * forwarded, these got whatever answer the picked client gave (sometimes a success):
  * trace_    - Tracing: reth's module is off; other clients may serve it, unmetered
  * txpool_   - Mempool contents: reth's module is off; nethermind serves it
- * web3_     - reth's web3 module is off (plan D4: remove here if it's enabled on the nodes)
  * erigon_   - Erigon's API, not a reth one
  * ots_      - Otterscan's API: exists in reth, off
  * alchemy_  - Alchemy's indexer products, not node methods
  * parity_   - nethermind-only module (on by default there)
  * proof_    - nethermind-only module (on by default there)
+ * rpc_      - node-specific: rpc_modules lists one node's namespaces, not the endpoint's
  */
 const BLOCKED_NAMESPACES = [
   'admin_',
@@ -47,12 +47,12 @@ const BLOCKED_NAMESPACES = [
   'les_',
   'trace_',
   'txpool_',
-  'web3_',
   'erigon_',
   'ots_',
   'alchemy_',
   'parity_',
-  'proof_'
+  'proof_',
+  'rpc_'
 ];
 
 /**
