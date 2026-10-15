@@ -41,6 +41,21 @@ const ipRateLimitPerDay = 5000;      // Max requests per day for an IP with no o
 const rateLimitPollInterval = 10;   // How often to poll DB for rate limit data (seconds)
 
 // =============================================================================
+// BURST LIMITS (bg-rpc-docs EDGE_BURST_LIMIT_PLAN.md, B1–B3; utils/burstLimiter.js)
+// =============================================================================
+// Short-window limits per caller, decided in memory at admission, in request units.
+// 'off' | 'log' | 'enforce'. 'log': nothing is refused; the requests enforcement would
+// refuse are logged (🪣) and counted in /ratelimitstatus. Log-only first (D4); final
+// numbers come from what log-only shows (Q6).
+const burstLimitMode = 'log';
+const burstLimits = {
+  // a tracked origin (deployed app); measured peak 2026-10-01..15: 102 in 1 s, 276 in 10 s
+  origin: { bucketSize: 300, refillPerSecond: 30, maxInFlight: 50, maxGetLogsInFlight: 4 },
+  // an IP with no origin (or an untracked one); measured peak: 92 in 1 s, 324 in 10 s
+  ip: { bucketSize: 200, refillPerSecond: 20, maxInFlight: 20, maxGetLogsInFlight: 4 }
+};
+
+// =============================================================================
 // REQUEST COUNT WEIGHTS (for rate limiting)
 // =============================================================================
 // Each request counts for one or more "units" toward the limits above (e.g.
@@ -204,6 +219,8 @@ export {
   originRateLimitPerDay,
   ipRateLimitPerDay,
   rateLimitPollInterval,
+  burstLimitMode,
+  burstLimits,
   maxBatchLength,
   maxRequestBodySize,
   callGasCap,

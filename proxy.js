@@ -19,7 +19,7 @@ import { rejectDisabledMethods } from './utils/disabledMethods.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
 import {
-  maxRequestBodySize, callGasCap,
+  maxRequestBodySize, callGasCap, burstLimitMode, burstLimits,
   getLogsMethods, getLogsGlobalConcurrency, getLogsMaxPerBatch, getLogsUpstreamTimeoutMs, getLogsMaxResponseBytes
 } from './config.js';
 import { redactUrl } from './utils/redactUrl.js';
@@ -27,6 +27,7 @@ import { validateGetLogs, startGetLogsPollers, getGetLogsState } from './utils/g
 import { requestUnits } from './utils/requestUnits.js';
 import { spliceIntoBatchResponse } from './utils/batchMerge.js';
 import { callGasFloorRejects } from './utils/callGasFloor.js';
+import { createBurstLimiter } from './utils/burstLimiter.js';
 import { logRejectedRequest } from './utils/rejectLogger.js';
 import { internalAgent } from './utils/internalAgent.js';
 import { upstreamHeaders } from './utils/upstreamHeaders.js';
@@ -178,6 +179,25 @@ async function makeFallbackRequest(data, headers) {
 // getLogs-path in-flight counter (edge-wide cap, D8).
 let getLogsInFlight = 0;
 
+// Short-window limits per caller (utils/burstLimiter.js; log-only while burstLimitMode is 'log')
+const burstLimiter = createBurstLimiter({ mode: burstLimitMode, limits: burstLimits });
+
+// Units one item costs at admission: the shared cost table, eth_getLogs by its resolved
+// range (validateGetLogs only reads the cached head and floor; an item it rejects counts
+// as one block, as requestUnits does).
+function admissionUnits(item) {
+  if (item?.method !== 'eth_getLogs') return requestUnits(item);
+  const verdict = validateGetLogs(item);
+  return requestUnits(item, verdict.ok ? verdict.blockCount : undefined);
+}
+
+// Units a served request counts toward the hourly and daily limits (shared cost table).
+// getLogs never reaches the paths that use this, so no block count is needed.
+function servedUnits(body) {
+  const requests = Array.isArray(body) ? body : [body];
+  return requests.reduce((sum, r) => sum + requestUnits(r), 0);
+}
+
 // Forward a getLogs-path request to bg-rpc-proxy. Differences from
 // makePrimaryRequest: its own (longer) timeout, a response size cap, and it never
 // touches the circuit breaker or the fallback: a getLogs failure is returned to the
@@ -316,7 +336,27 @@ app.post("/", async (req, res) => {
       .json(perItem(req.body, rateLimitError(requestId, rateLimitResult)));
     return;
   }
-  
+
+  // Short-window limits per caller (bg-rpc-docs EDGE_BURST_LIMIT_PLAN.md B1–B3): the whole
+  // request at once, before anything is answered or forwarded. In 'log' mode nothing is
+  // refused here. The in-flight slots are given back when the response closes (finished
+  // or aborted).
+  const burstItems = Array.isArray(req.body) ? req.body : [req.body];
+  const burst = burstLimiter.admit({
+    ip: clientIP,
+    origin,
+    units: burstItems.reduce((sum, item) => sum + admissionUnits(item), 0),
+    items: burstItems.length,
+    getLogsItems: burstItems.filter(item => getLogsMethods.includes(item?.method)).length
+  });
+  if (burst.refused) {
+    res.status(429)
+      .set('Retry-After', String(burst.refused.retryAfter))
+      .json(perItem(req.body, jsonRpcError(requestIdOf(req.body), -32005, burst.refused.message, { retryAfter: burst.refused.retryAfter })));
+    return;
+  }
+  res.on('close', burst.release);
+
   // eth_call items whose calldata floor (EIP-7623) is above their gas fail on every node:
   // answered here per item with the nodes' -32000 "intrinsic gas too low", and charged
   // like served calls (utils/callGasFloor.js). The rest of a batch goes on.
@@ -493,7 +533,7 @@ app.post("/", async (req, res) => {
   let responseData = null;
   
   if (isUsingFallback) {
-    console.log(`🚨 Using fallback URL for request from ${req.headers.origin || 'unknown'} - NOT counting in Firebase`);
+    console.log(`🚨 Using fallback URL for request from ${req.headers.origin || 'unknown'} - counts toward rate limits`);
   }
 
   // Handle method counting for both single requests and batch requests
@@ -545,10 +585,13 @@ app.post("/", async (req, res) => {
         response = await makeFallbackRequest(req.body, req.headers);
         console.log("POST FALLBACK SUCCESS", response.status, `${response.headers?.['content-length'] ?? '?'} bytes`);
         
-        // Early return - don't count in Firebase since we used fallback
+        // Early return. The fallback is paid, so its answers count toward the hourly and
+        // daily limits like the pool's (bg-rpc-docs EDGE_BURST_LIMIT_PLAN.md D3).
         responseData = response.data;
         res.status(response.status).send(perItem(req.body, response.data));
-        console.log("🚨 Used immediate fallback - NOT counting in Firebase");
+        const fallbackUnits = servedUnits(req.body);
+        updateIpCountMap(clientIP, req.headers.origin, fallbackUnits);
+        console.log(`🚨 Used immediate fallback - ${fallbackUnits} unit(s) counted toward rate limits`);
         return;
       }
     }
@@ -574,21 +617,26 @@ app.post("/", async (req, res) => {
     return; // Don't count failed requests in Firebase
   }
 
-  // Only count requests in Firebase if we successfully used primary URL (not fallback)
-  if (!actuallyUsedFallback && responseData && req.headers) {
+  // Every served answer counts toward the hourly and daily limits, the paid fallback's
+  // too (bg-rpc-docs EDGE_BURST_LIMIT_PLAN.md D3). The Firebase ledger (updateUrlCountMap)
+  // stays primary-only; its writes are off (config.js firebaseUpdatesEnabled).
+  if (responseData && req.headers) {
     // Weighted request count for rate limiting (shared cost table; heavy methods
-    // count for more). getLogs never reaches this path, so no block count is needed.
+    // count for more).
     const requests = Array.isArray(req.body) ? req.body : [req.body];
-    const requestCount = requests.reduce((sum, r) => sum + requestUnits(r), 0);
+    const requestCount = servedUnits(req.body);
     if (requests.length > 1 || requestCount !== requests.length) {
       console.log(`Request count: ${requests.length} call(s) → ${requestCount} weighted unit(s)`);
     }
 
     // Always track IP counts (even without origin)
     updateIpCountMap(getClientIP(req), req.headers.origin, requestCount);
-    
+    if (actuallyUsedFallback) {
+      console.log(`🚨 Used fallback for final response - ${requestCount} unit(s) counted toward rate limits`);
+    }
+
     // Only track URL counts if origin is present
-    if (req.headers.origin) {
+    if (req.headers.origin && !actuallyUsedFallback) {
       updateUrlCountMap(req.headers.origin, requestCount);
       
       if (last === req.connection.remoteAddress) {
@@ -610,8 +658,6 @@ app.post("/", async (req, res) => {
         }
       }
     }
-  } else if (actuallyUsedFallback) {
-    console.log(`🚨 Used fallback for final response - NOT counting in Firebase`);
   }
 
   // Handle method counting for both single requests and batch requests
@@ -810,6 +856,7 @@ app.get("/ratelimitstatus", requireAdminKey, (req, res) => {
     const status = getRateLimitStatus();
     res.json({
       ...status,
+      burst: burstLimiter.status(),
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -837,6 +884,9 @@ startBackgroundTasks();
 
 // Start rate limit polling
 startRateLimitPolling();
+
+// Burst limiter's sweep (forgets idle callers) and its startup line
+burstLimiter.start();
 
 // Start IP blacklist watcher
 startWatchingBlacklist();
