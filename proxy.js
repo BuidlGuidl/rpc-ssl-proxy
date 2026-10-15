@@ -19,13 +19,15 @@ import { rejectDisabledMethods } from './utils/disabledMethods.js';
 import { isIPBlacklisted, startWatchingBlacklist, getBlacklistStatus } from './utils/ipBlacklist.js';
 import { requireAdminKey } from './utils/adminAuth.js';
 import {
-  maxRequestBodySize,
+  maxRequestBodySize, callGasCap,
   getLogsMethods, getLogsGlobalConcurrency, getLogsMaxPerBatch, getLogsUpstreamTimeoutMs, getLogsMaxResponseBytes
 } from './config.js';
 import { redactUrl } from './utils/redactUrl.js';
 import { validateGetLogs, startGetLogsPollers, getGetLogsState } from './utils/getLogsPolicy.js';
 import { requestUnits } from './utils/requestUnits.js';
 import { spliceIntoBatchResponse } from './utils/batchMerge.js';
+import { callGasFloorRejects } from './utils/callGasFloor.js';
+import { logRejectedRequest } from './utils/rejectLogger.js';
 import { internalAgent } from './utils/internalAgent.js';
 import { upstreamHeaders } from './utils/upstreamHeaders.js';
 
@@ -315,6 +317,31 @@ app.post("/", async (req, res) => {
     return;
   }
   
+  // eth_call items whose calldata floor (EIP-7623) is above their gas fail on every node:
+  // answered here per item with the nodes' -32000 "intrinsic gas too low", and charged
+  // like served calls (utils/callGasFloor.js). The rest of a batch goes on.
+  const gasFloorRejects = callGasFloorRejects(req.body, callGasCap);
+  if (gasFloorRejects.length > 0) {
+    const units = gasFloorRejects.reduce((sum, r) => sum + r.units, 0);
+    updateIpCountMap(clientIP, origin, units);
+    if (origin) updateUrlCountMap(origin, units);
+    const reasons = gasFloorRejects.map(r => Array.isArray(req.body) ? `batch[${r.index}]: ${r.reason}` : r.reason);
+    console.log(`⛽ Calldata over gas from ${clientIP}: ${reasons.join('; ')} (charged ${units} unit(s))`);
+    logRejectedRequest(req, reasons.join('; '));
+    if (!Array.isArray(req.body)) {
+      res.status(200).json(gasFloorRejects[0].response);
+      return;
+    }
+    const rejectedIndexes = new Set(gasFloorRejects.map(r => r.index));
+    const remaining = req.body.filter((_, i) => !rejectedIndexes.has(i));
+    if (remaining.length === 0) {
+      res.status(200).json(gasFloorRejects.map(r => r.response));
+      return;
+    }
+    req.body = remaining;
+    spliceIntoBatchResponse(res, gasFloorRejects, remaining);
+  }
+
   // ---- getLogs policy path (plan 4c/4d, policy pass) ----------------------------
   if (heavyItems.length > 0) {
     // 1. validate every heavy item. A rejected item is answered per item (its -32602 /

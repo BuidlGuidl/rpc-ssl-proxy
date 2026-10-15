@@ -65,6 +65,14 @@ const maxBatchLength = 50;
 const maxRequestBodySize = '4mb';
 
 /**
+ * Gas an eth_call without a "gas" field gets on the nodes: geth's and reth's default
+ * --rpc.gascap. An eth_call whose calldata floor (EIP-7623) is above its gas, or above
+ * this when it sends none, gets -32000 "intrinsic gas too low" at the edge and is charged
+ * like a served call (utils/callGasFloor.js).
+ */
+const callGasCap = 50_000_000;
+
+/**
  * Caller headers (lowercase) that are forwarded upstream. Everything else is dropped:
  * bg-rpc-proxy forwards headers to its fallback provider, so an X-Api-Key would leak;
  * a forwarded Content-Length/Transfer-Encoding no longer matches the re-serialized
@@ -198,6 +206,7 @@ export {
   rateLimitPollInterval,
   maxBatchLength,
   maxRequestBodySize,
+  callGasCap,
   forwardedHeaders,
   disabledMethods,
   wsOnlyMethods,
