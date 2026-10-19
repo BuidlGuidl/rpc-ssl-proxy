@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { createBurstLimiter, burstKey } from '../utils/burstLimiter.js';
 import { burstLimits, burstLimitMode } from '../config.js';
 
+// The plan's starting numbers; the tests below are written against these, not config.js
 const LIMITS = {
   origin: { bucketSize: 300, refillPerSecond: 30, maxInFlight: 50, maxGetLogsInFlight: 4 },
   ip: { bucketSize: 200, refillPerSecond: 20, maxInFlight: 20, maxGetLogsInFlight: 4 }
@@ -24,9 +25,12 @@ function one(limiter, { ip = '1.2.3.4', origin = APP, units = 1, keep = false } 
   return r;
 }
 
-test('config: log-only, the plan\'s starting numbers', () => {
-  assert.equal(burstLimitMode, 'log');
-  assert.deepEqual(burstLimits, LIMITS);
+test('config: enforcing, the current numbers', () => {
+  assert.equal(burstLimitMode, 'enforce');
+  assert.deepEqual(burstLimits, {
+    origin: { bucketSize: 600, refillPerSecond: 60, maxInFlight: 75, maxGetLogsInFlight: 4 },
+    ip: { bucketSize: 400, refillPerSecond: 40, maxInFlight: 30, maxGetLogsInFlight: 4 }
+  });
 });
 
 test('burstKey: same classes as the hourly limiter', () => {
@@ -139,6 +143,36 @@ test('log mode: nothing refused; what enforcement would refuse is logged and cou
   assert.equal(s.totals.bucket, 6);
   assert.equal(s.totals.admitted, 600);
   assert.deepEqual(s.topRefused[0], { key: 'origin:app.example.com', refused: 6, byCheck: { bucket: 6, inFlight: 0, getLogs: 0 } });
+});
+
+test('sweep: logs refusals held back by the 10 s window before forgetting the caller', () => {
+  const { limiter, clock, lines } = setup('log');
+  for (let i = 0; i < 200; i++) one(limiter, { origin: null });
+  for (let i = 0; i < 4; i++) one(limiter, { origin: null }); // 1 line, 3 held back
+  assert.equal(lines.length, 1);
+  clock.t += 5_000;
+  limiter.sweep(); // still inside the window: nothing yet
+  assert.equal(lines.length, 1);
+  clock.t += 55_000;
+  limiter.sweep();
+  assert.equal(lines.at(-1), '🪣 Burst: Would refuse (log-only) ip:1.2.3.4: +3 more since the last line');
+  assert.equal(limiter.status().callersTracked, 0);
+  limiter.sweep(); // logged once
+  assert.equal(lines.length, 2);
+});
+
+test('sweep: a caller still tracked gets its held-back count logged once, not again on its next line', () => {
+  const { limiter, clock, lines } = setup('log');
+  const held = [];
+  for (let i = 0; i < 20; i++) held.push(one(limiter, { origin: null, keep: true }));
+  for (let i = 0; i < 3; i++) one(limiter, { origin: null }); // 1 line, 2 held back
+  clock.t += 10_000;
+  limiter.sweep();
+  assert.equal(lines.at(-1), '🪣 Burst: Would refuse (log-only) ip:1.2.3.4: +2 more since the last line');
+  assert.equal(limiter.status().callersTracked, 1); // still in flight
+  one(limiter, { origin: null });
+  assert.doesNotMatch(lines.at(-1), /more since the last line/);
+  held.forEach(h => h.release());
 });
 
 test('off mode: nothing checked or tracked', () => {

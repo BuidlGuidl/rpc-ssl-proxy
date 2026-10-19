@@ -46,13 +46,14 @@ const rateLimitPollInterval = 10;   // How often to poll DB for rate limit data 
 // Short-window limits per caller, decided in memory at admission, in request units.
 // 'off' | 'log' | 'enforce'. 'log': nothing is refused; the requests enforcement would
 // refuse are logged (🪣) and counted in /ratelimitstatus. Log-only first (D4); final
-// numbers come from what log-only shows (Q6).
-const burstLimitMode = 'log';
+// numbers come from what log-only shows (Q6). Enforcing since 2026-10-19 (log-only
+// 2026-10-15..19), with the numbers below raised from the plan's.
+const burstLimitMode = 'enforce';
 const burstLimits = {
   // a tracked origin (deployed app); measured peak 2026-10-01..15: 102 in 1 s, 276 in 10 s
-  origin: { bucketSize: 300, refillPerSecond: 30, maxInFlight: 50, maxGetLogsInFlight: 4 },
+  origin: { bucketSize: 600, refillPerSecond: 60, maxInFlight: 75, maxGetLogsInFlight: 4 },
   // an IP with no origin (or an untracked one); measured peak: 92 in 1 s, 324 in 10 s
-  ip: { bucketSize: 200, refillPerSecond: 20, maxInFlight: 20, maxGetLogsInFlight: 4 }
+  ip: { bucketSize: 400, refillPerSecond: 40, maxInFlight: 30, maxGetLogsInFlight: 4 }
 };
 
 // =============================================================================

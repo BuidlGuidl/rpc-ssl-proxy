@@ -104,8 +104,20 @@ function createBurstLimiter({ mode, limits, now = Date.now, log = console.log })
     const more = s.unlogged > 0 ? ` (+${s.unlogged} more since the last line)` : '';
     s.lastLogAt = t;
     s.unlogged = 0;
-    const verb = mode === 'enforce' ? 'Refused' : 'Would refuse (log-only)';
-    log(`🪣 Burst: ${verb} ${caller.key}: ${r.check} (${r.detail}); ${items} item(s), ${units} unit(s); retry in ${r.retryAfter} s${more}`);
+    log(`🪣 Burst: ${verb()} ${caller.key}: ${r.check} (${r.detail}); ${items} item(s), ${units} unit(s); retry in ${r.retryAfter} s${more}`);
+  }
+
+  function verb() {
+    return mode === 'enforce' ? 'Refused' : 'Would refuse (log-only)';
+  }
+
+  // Refusals held back by LOG_EVERY_MS are otherwise only reported on the caller's next
+  // line; log them once the window has passed, so a caller that goes quiet (and is then
+  // swept) doesn't take them with it
+  function flushUnlogged(key, s) {
+    if (s.unlogged === 0 || now() - s.lastLogAt < LOG_EVERY_MS) return;
+    log(`🪣 Burst: ${verb()} ${key}: +${s.unlogged} more since the last line`);
+    s.unlogged = 0;
   }
 
   /**
@@ -153,6 +165,7 @@ function createBurstLimiter({ mode, limits, now = Date.now, log = console.log })
     for (const [key, s] of callers) {
       const limit = limits[key.startsWith('origin:') ? 'origin' : 'ip'];
       refill(s, limit);
+      flushUnlogged(key, s);
       if (s.inFlight === 0 && s.getLogsInFlight === 0 && s.tokens >= limit.bucketSize) callers.delete(key);
     }
   }
